@@ -1,0 +1,27 @@
+stages:
+  - build
+  - deploy
+
+variables:
+  IMAGE: "$CI_REGISTRY_IMAGE:latest"
+  GOOGLE_APPLICATION_CREDENTIALS: "/tmp/gcp-key.json"
+
+build:
+  stage: build
+  image: docker:latest
+  services:
+    - docker:dind
+  script:
+    - echo "$GCP_SERVICE_ACCOUNT_KEY" > "$GOOGLE_APPLICATION_CREDENTIALS"
+    - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" "$CI_REGISTRY"
+    - docker build -t "$IMAGE" application/
+    - docker push "$IMAGE"
+
+deploy-production:
+  stage: deploy
+  image: bitnami/kubectl:latest
+  only:
+    - main
+  script:
+    - echo "$GCP_SERVICE_ACCOUNT_KEY" > "$GOOGLE_APPLICATION_CREDENTIALS"
+    - kubectl apply -k gitops/overlays/production

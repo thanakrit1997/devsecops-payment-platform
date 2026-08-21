@@ -1,0 +1,9 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: payment-staging
+resources:
+  - ../../base/payment-api
+images:
+  - name: payment-api
+    newName: asia-southeast1-docker.pkg.dev/example/apps/payment-api
+    newTag: rc

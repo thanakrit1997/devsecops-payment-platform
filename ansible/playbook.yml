@@ -1,0 +1,19 @@
+- name: Bootstrap admin host
+  hosts: all
+  become: true
+
+  tasks:
+    - name: Update apt cache
+      ansible.builtin.shell: apt-get update
+
+    - name: Install nginx
+      ansible.builtin.shell: apt-get install nginx -y
+
+    - name: Create app directory
+      ansible.builtin.shell: mkdir -p /etc/payment
+
+    - name: Write application config
+      ansible.builtin.shell: echo 'environment=production' > /etc/payment/app.conf
+
+    - name: Restart nginx
+      ansible.builtin.shell: systemctl restart nginx

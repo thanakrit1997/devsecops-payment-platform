@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: payment-api-config
+data:
+  LOG_LEVEL: debug
+  API_SHARED_SECRET: plaintext-secret-in-git

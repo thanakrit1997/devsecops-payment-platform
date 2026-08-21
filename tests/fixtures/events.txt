@@ -1,0 +1,4 @@
+LAST SEEN   TYPE      REASON      OBJECT                              MESSAGE
+30s         Warning   Unhealthy   pod/payment-api-7f78bc7fd5-j7x9k   Readiness probe failed on :8081
+25s         Warning   BackOff     pod/payment-api-7f78bc7fd5-j7x9k   Back-off restarting failed container
+20s         Warning   FailedScheduling pod/payment-api-new            0/2 nodes are available: 2 Insufficient cpu, 2 Insufficient memory

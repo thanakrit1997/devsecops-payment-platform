@@ -1,0 +1,5 @@
+2026-08-21T00:13:04Z payment-api listening on :8080
+2026-08-21T00:13:05Z connecting to mongodb://root:supersecret@mongo:27017/payment
+2026-08-21T00:13:06Z redis connected
+2026-08-21T00:13:08Z allocating startup cache
+2026-08-21T00:13:13Z process terminated

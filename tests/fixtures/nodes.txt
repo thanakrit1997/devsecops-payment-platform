@@ -1,0 +1,3 @@
+NAME       CPU(cores)   CPU%   MEMORY(bytes)   MEMORY%
+gke-node1  3500m        88%    14500Mi         91%
+gke-node2  3300m        83%    14000Mi         88%

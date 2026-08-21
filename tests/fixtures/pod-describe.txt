@@ -1,0 +1,18 @@
+Name:             payment-api-7f78bc7fd5-j7x9k
+Namespace:        payment-production
+Status:           Running
+Containers:
+  payment-api:
+    State:          Waiting
+      Reason:       CrashLoopBackOff
+    Last State:     Terminated
+      Reason:       OOMKilled
+      Exit Code:    137
+    Ready:          False
+    Restart Count:  8
+    Requests:
+      cpu:     2
+      memory:  4Gi
+Events:
+  Warning  Unhealthy  Readiness probe failed: dial tcp 10.20.1.13:8081: connect: connection refused
+  Warning  BackOff    Back-off restarting failed container payment-api
