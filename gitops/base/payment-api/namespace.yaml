@@ -6,6 +6,9 @@ metadata:
   labels:
     pod-security.kubernetes.io/enforce: restricted
     pod-security.kubernetes.io/enforce-version: latest
+    # enforce only rejects Pods; warn/audit also flag Deployments at apply time.
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/audit: restricted
   annotations:
     # Never let a Git mistake delete the namespace (and the Secret created
     # out-of-band inside it).
