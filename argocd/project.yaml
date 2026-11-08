@@ -1,0 +1,36 @@
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: payment
+  namespace: argocd
+spec:
+  description: payment-api environments
+  sourceRepos:
+    - https://github.com/101Krit/devsecops-payment-platform.git
+  destinations:
+    - name: payment-gke
+      namespace: payment-dev
+    - name: payment-gke
+      namespace: payment-staging
+    - name: payment-gke
+      namespace: payment-production
+  # Only what the overlays render. A RoleBinding or privileged object added
+  # to Git is refused instead of being synced.
+  clusterResourceWhitelist:
+    - group: ""
+      kind: Namespace
+  namespaceResourceWhitelist:
+    - group: ""
+      kind: ServiceAccount
+    - group: ""
+      kind: ConfigMap
+    - group: ""
+      kind: Service
+    - group: apps
+      kind: Deployment
+    - group: autoscaling
+      kind: HorizontalPodAutoscaler
+    - group: policy
+      kind: PodDisruptionBudget
+    - group: networking.k8s.io
+      kind: NetworkPolicy

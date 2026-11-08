@@ -10,6 +10,32 @@ spec:
     - Ingress
     - Egress
   ingress:
-    - {}
+    # Same-namespace callers only. Add the gateway / caller namespace here
+    # when one exists.
+    - from:
+        - podSelector: {}
+      ports:
+        - protocol: TCP
+          port: 8080
   egress:
-    - {}
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # Data services (MongoDB, Redis, Kafka). Destination left open because
+    # their location (in-cluster vs managed) is not defined in this repo.
+    - ports:
+        - protocol: TCP
+          port: 27017
+        - protocol: TCP
+          port: 6379
+        - protocol: TCP
+          port: 9092

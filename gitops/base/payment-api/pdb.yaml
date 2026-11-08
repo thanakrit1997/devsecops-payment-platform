@@ -3,7 +3,9 @@ kind: PodDisruptionBudget
 metadata:
   name: payment-api
 spec:
-  minAvailable: 2
+  # maxUnavailable (not minAvailable: 2) so drains never deadlock at the
+  # HPA minimum while still evicting one pod at a time.
+  maxUnavailable: 1
   selector:
     matchLabels:
       app: payment-api

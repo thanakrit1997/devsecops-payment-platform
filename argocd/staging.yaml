@@ -4,15 +4,25 @@ metadata:
   name: payment-api-staging
   namespace: argocd
 spec:
-  project: default
+  project: payment
   source:
-    repoURL: https://gitlab.example.com/platform/gitops.git
+    repoURL: https://github.com/101Krit/devsecops-payment-platform.git
     targetRevision: main
     path: gitops/overlays/staging
   destination:
-    server: https://kubernetes.default.svc
+    name: payment-gke
     namespace: payment-staging
+  # The HPA owns replicas. Without this, the first sync after removing
+  # spec.replicas from Git resets a running Deployment to 1 replica.
+  ignoreDifferences:
+    - group: apps
+      kind: Deployment
+      jsonPointers:
+        - /spec/replicas
   syncPolicy:
     automated:
       prune: true
       selfHeal: true
+    syncOptions:
+      - RespectIgnoreDifferences=true
+      - PruneLast=true # old hash-suffixed ConfigMap survives until the new pods are healthy

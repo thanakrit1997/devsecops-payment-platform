@@ -5,7 +5,12 @@ metadata:
   labels:
     app: payment-api
 spec:
-  replicas: 2
+  # No spec.replicas: the HPA owns the replica count. Setting both makes
+  # Argo CD self-heal and the HPA fight over the value.
+  strategy:
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
   selector:
     matchLabels:
       app: payment-api
@@ -14,37 +19,78 @@ spec:
       labels:
         app: payment-api
     spec:
+      serviceAccountName: payment-api
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: payment-api
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: payment-api
       containers:
         - name: payment-api
-          image: payment-api:latest
-          imagePullPolicy: Always
+          image: payment-api # registry + digest set per overlay
+          imagePullPolicy: IfNotPresent
           ports:
             - name: http
               containerPort: 8080
+          envFrom:
+            - configMapRef:
+                name: payment-api-config
           env:
-            - name: APP_ENV
-              value: production
+            # Credentials are never stored in Git. The Secret is created
+            # out-of-band (Secret Manager in production).
             - name: MONGODB_URL
-              value: mongodb://root:supersecret@mongo:27017/payment
-            - name: REDIS_URL
-              value: redis://redis:6379
-            - name: KAFKA_BROKERS
-              value: kafka:9092
+              valueFrom:
+                secretKeyRef:
+                  name: payment-api-secrets
+                  key: MONGODB_URL
+            - name: API_SHARED_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: payment-api-secrets
+                  key: API_SHARED_SECRET
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 2
+            failureThreshold: 30
           readinessProbe:
             httpGet:
               path: /ready
-              port: 8081
-            initialDelaySeconds: 1
-            periodSeconds: 2
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
           livenessProbe:
             httpGet:
               path: /health
-              port: 8080
-            initialDelaySeconds: 2
-            periodSeconds: 2
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
           resources:
             requests:
-              cpu: "2"
-              memory: 4Gi
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              memory: 128Mi
           securityContext:
-            privileged: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]

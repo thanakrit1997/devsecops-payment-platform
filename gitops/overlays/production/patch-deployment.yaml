@@ -1,9 +1,8 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: wrong-payment-api-name
+  name: payment-api
 spec:
-  replicas: 5
   template:
     spec:
       containers:
@@ -11,4 +10,6 @@ spec:
           resources:
             requests:
               cpu: 500m
+              memory: 512Mi
+            limits:
               memory: 512Mi

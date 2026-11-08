@@ -3,7 +3,13 @@ kind: Kustomization
 namespace: payment-dev
 resources:
   - ../../base/payment-api
+configMapGenerator:
+  - name: payment-api-config
+    behavior: merge
+    literals:
+      - APP_ENV=dev
+      - LOG_LEVEL=debug
 images:
   - name: payment-api
-    newName: asia-southeast1-docker.pkg.dev/example/apps/payment-api
-    newTag: latest
+    newName: asia-southeast1-docker.pkg.dev/candidate-7sol-test/payment-tn/payment-api
+    digest: sha256:0000000000000000000000000000000000000000000000000000000000000000 # updated by CI after each main build

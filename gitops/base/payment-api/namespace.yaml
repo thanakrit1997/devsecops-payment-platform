@@ -1,0 +1,12 @@
+# Renamed per environment by the overlay's `namespace:` transformer.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: payment-api
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+  annotations:
+    # Never let a Git mistake delete the namespace (and the Secret created
+    # out-of-band inside it).
+    argocd.argoproj.io/sync-options: Prune=false

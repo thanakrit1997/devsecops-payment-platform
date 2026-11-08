@@ -2,9 +2,19 @@ apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
 resources:
+  - namespace.yaml
+  - serviceaccount.yaml
   - deployment.yaml
   - service.yaml
   - hpa.yaml
   - pdb.yaml
   - network-policy.yaml
-  - configmap.yaml
+
+# Generated (hash-suffixed) so a config change rolls the Deployment.
+# Non-secret values only; credentials come from the payment-api-secrets Secret.
+configMapGenerator:
+  - name: payment-api-config
+    literals:
+      - LOG_LEVEL=info
+      - REDIS_URL=redis://redis:6379
+      - KAFKA_BROKERS=kafka:9092
