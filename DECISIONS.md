@@ -654,6 +654,8 @@ kind delete cluster --name argocd-hub
 ```
 Destroying the Artifact Registry repository deletes the image; the digests committed in the overlays then need a rebuild (new digest) before the next deployment.
 
+**Performed 2026-11-08 20:12-20:24 UTC** to avoid ongoing cost: `Apply complete! Resources: 0 added, 1 changed` (deletion protection off), `Destroy complete! Resources: 6 destroyed`, both buckets and the local hub removed. Afterwards the project lists no cluster, Artifact Registry repository, bucket, instance, disk, address or non-default firewall rule from this work; only the pre-existing resources noted in E6 remain. The environment can be recreated with the README steps (about 15 minutes).
+
 ---
 
 ## Final summary
