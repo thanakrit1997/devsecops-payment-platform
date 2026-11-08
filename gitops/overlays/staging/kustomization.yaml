@@ -12,4 +12,4 @@ configMapGenerator:
 images:
   - name: payment-api
     newName: asia-southeast1-docker.pkg.dev/candidate-7sol-test/payment-tn/payment-api
-    digest: sha256:0000000000000000000000000000000000000000000000000000000000000000 # updated by CI after each main build
+    digest: sha256:71c68aed57c996931734763ed84aaa9f7c722e9fbe5db088d91840e6c2ed4b62 # updated by CI after each main build
