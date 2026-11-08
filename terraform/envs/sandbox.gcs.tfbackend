@@ -1,0 +1,2 @@
+bucket = "candidate-7sol-test-tfstate-tn"
+prefix = "payment/sandbox"

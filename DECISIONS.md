@@ -229,3 +229,55 @@ Production auto-sync means a merged change deploys immediately. Accepted because
 ### Verification
 
 `scripts/validate.sh`: renders all overlays and `argocd/`, asserts production requirements, fails on `privileged`, `:latest`, Deployment `replicas`, or credential literals (negative tests run: HPA floor 4, privileged re-added, tag instead of digest — all rejected). Server-side dry-run and live sync are recorded with the deployment evidence.
+
+---
+
+## Module 2 — Terraform / GCP / GKE
+
+### Observation
+
+| Focus area | Baseline | Location |
+|---|---|---|
+| IAM / credentials | App SA with `roles/owner`; JSON key created, exported as output, stored in state | `iam.tf` |
+| Cluster exposure | Authorized networks `0.0.0.0/0`; no private nodes (public node IPs) | `gke.tf:19-24` |
+| Workload identity | Not enabled; pods can read node credentials from the metadata server | `gke.tf` |
+| Node / workload separation | Single default pool, default SA, `cloud-platform` scope | `gke.tf:8-17` |
+| Upgrade / maintenance | No release channel, no maintenance window | `gke.tf` |
+| Deletion safeguards | `deletion_protection = false` | `gke.tf:6` |
+| State | Local state; backend only an example | `backend.tf.example` |
+| Reproducibility | Provider `>= 5.0` (8.10.0 today, any future major tomorrow), no lock file; runs on the `default` VPC; deprecated `remove_default_node_pool` | `versions.tf`, `variables.tf` |
+
+### Decision
+
+| Area | Change | Reason |
+|---|---|---|
+| IAM | **Delete** the application SA, its `roles/owner` binding, the key and the key output | The app calls no Google API. Least privilege for a workload with no need is *no identity*, not a smaller role |
+| IAM | Dedicated node SA with `roles/container.defaultNodeServiceAccount` + `artifactregistry.reader` on the one repository, behind `manage_iam` | Nodes need logs / metrics / image pull only. `manage_iam = false` + `node_service_account` for identities that cannot write IAM; a precondition stops a silent fallback to the default SA |
+| Exposure | Private nodes; public IP endpoint restricted to `master_authorized_networks` (required variable, `0.0.0.0/0` rejected by validation); `gcp_public_cidrs_access_enabled = false`; IAM-authorised DNS endpoint | No public node IPs. API reachable only from listed CIDRs, or with a Google identity that holds `container.clusters.connect` — reviewers do not need an IP allow-list entry |
+| Workload identity | `workload_pool` on the cluster, `GKE_METADATA` on every pool | Pods get their own (currently none) identity and cannot reach node credentials — this also contains the sandbox's broader node SA |
+| Separation | No default pool. `system` pool (1/zone) for GKE components; dedicated `payment` pool (autoscaling 1-3/zone) tainted `dedicated=payment:NoSchedule` — the Deployment carries the matching toleration + `nodeSelector: pool=payment`; Shielded VM secure boot | System components and application pods cannot starve each other; separate upgrade / scaling characteristics. Tainting the workload pool (not the system pool) cannot leave a system component without a schedulable node |
+| Upgrades | `REGULAR` release channel; maintenance window Sat/Sun 00:00-06:00 Asia/Bangkok (`BYDAY=FR,SA` at 17:00 UTC — RRULE days are UTC); node surge upgrade `max_surge 1 / max_unavailable 0`; auto-repair / auto-upgrade | Supported, patched versions with predictable timing; 12 h/week satisfies GKE's ≥ 48 h per 32 days; node upgrades never remove capacity first (works with the PDB from Module 5) |
+| Deletion | `deletion_protection = true` **and** `lifecycle { prevent_destroy = true }` | `deletion_protection` is enforced only when the cluster itself is deleted — after `destroy` has already removed the node pools. `prevent_destroy` rejects the whole plan first |
+| State | `backend "gcs" {}` with per-environment config (`envs/<env>.gcs.tfbackend`) | GCS backend locks natively; bucket: versioning, uniform access, public-access prevention; encryption at rest by default (CMEK optional). One prefix (or bucket) per environment limits blast radius |
+| Reproducibility | Provider `~> 8.10` + committed `.terraform.lock.hcl` (linux_amd64 + darwin_arm64); own VPC / subnet / secondary ranges in code; per-environment `envs/<env>.tfvars`; `name_suffix` for shared projects | Same plan on every machine; nothing depends on hand-made or pre-existing network resources |
+| NetworkPolicy enforcement | `datapath_provider = "ADVANCED_DATAPATH"` (Dataplane V2) | Module 5 NetworkPolicies are enforced, not decorative |
+| Registry | Artifact Registry repository with `immutable_tags = true` | A pushed tag can never be re-pointed; deployments still pin digests |
+
+### Intentionally not done
+
+- **Cloud NAT** — private nodes reach Artifact Registry / Google APIs via Private Google Access; no workload needs internet egress yet. Add with the first workload that does.
+- **Binary Authorization** — enforcement needs attestors and signing in CI (Module 4); enabling it before signing exists would block every deploy.
+- **CMEK for etcd / state bucket** — default Google-managed encryption accepted for this scope.
+- **CI Workload Identity Federation pool** — belongs with Module 4; it also needs IAM writes.
+
+### Risk / trade-off
+
+The sandbox applies with `manage_iam = false`, so nodes run as the default compute SA (`roles/editor`). Mitigated by `GKE_METADATA` (pods cannot obtain the node token), private nodes and Shielded VMs; the dedicated node SA is ready in code for an identity with IAM rights. Regional cluster = 3 zones × 2 pools: higher cost than zonal, chosen for control-plane and zonal-failure availability of a payment service.
+
+### Verification
+
+- `terraform fmt -check`, `terraform validate` — clean, no deprecation warnings.
+- `terraform plan` against the real project (read-only, local backend copy, short-lived token): 6 resources to create with `envs/sandbox.tfvars`; 9 (adds node SA + two bindings) with `manage_iam = true`.
+- Negative checks: `master_authorized_networks = {any = "0.0.0.0/0"}` → `Invalid value for variable`; `manage_iam = false` without `node_service_account` → `Resource precondition failed`.
+- Independent review pass found three issues, all fixed: `deletion_protection` alone lets `destroy` delete node pools first; maintenance `BYDAY` was shifted a day by UTC evaluation; the workload pool was untainted.
+- Apply results are recorded with the deployment evidence.

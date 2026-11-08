@@ -20,6 +20,14 @@ spec:
         app: payment-api
     spec:
       serviceAccountName: payment-api
+      # Dedicated node pool (terraform/gke.tf: google_container_node_pool.payment).
+      nodeSelector:
+        pool: payment
+      tolerations:
+        - key: dedicated
+          operator: Equal
+          value: payment
+          effect: NoSchedule
       automountServiceAccountToken: false
       securityContext:
         runAsNonRoot: true

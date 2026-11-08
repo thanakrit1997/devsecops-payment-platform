@@ -1,8 +1,0 @@
-# Intentionally not wired into terraform {}.
-# Candidate should discuss remote state, locking/concurrency behavior,
-# access control, encryption, and separation by environment.
-#
-# backend "gcs" {
-#   bucket = "replace-me"
-#   prefix = "payment/production"
-# }
