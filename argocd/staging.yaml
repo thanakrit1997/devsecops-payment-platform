@@ -6,7 +6,7 @@ metadata:
 spec:
   project: payment
   source:
-    repoURL: https://github.com/101Krit/devsecops-payment-platform.git
+    repoURL: https://github.com/thanakrit1997/devsecops-payment-platform.git
     targetRevision: main
     path: gitops/overlays/staging
   destination:

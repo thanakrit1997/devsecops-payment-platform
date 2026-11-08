@@ -6,7 +6,7 @@ metadata:
 spec:
   description: payment-api environments
   sourceRepos:
-    - https://github.com/101Krit/devsecops-payment-platform.git
+    - https://github.com/thanakrit1997/devsecops-payment-platform.git
   destinations:
     - name: payment-gke
       namespace: payment-dev
