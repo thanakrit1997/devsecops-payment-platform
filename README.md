@@ -13,6 +13,7 @@ one section per module. Commit history follows the modules, starting from the un
 | 5 Kustomize + Argo CD | `gitops/`, `argocd/`, `DECISIONS.md` → Module 5 |
 | 6 MongoDB / Redis / Kafka | `DECISIONS.md` → Module 6 |
 | 7 Incident commander | `DECISIONS.md` → Module 7 |
+| Ansible (P2) | `ansible/`, `DECISIONS.md` → Ansible |
 | Deployment evidence | `DECISIONS.md` → Deployment and verification |
 
 Kubernetes customisation uses **Kustomize** only (no Helm).

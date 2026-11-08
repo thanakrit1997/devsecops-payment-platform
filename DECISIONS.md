@@ -78,7 +78,7 @@ Plan column: module where it is fixed, or why it is deferred.
 | P2-5 | No Go tests; smoke scripts assert status only | `application/`, `tests/` | M4 |
 | P2-6 | No graceful shutdown on SIGTERM | `application/src/main.go:35-36` | M4 (with the application tests; prevents dropped requests on rollout) |
 | P2-7 | `validate.sh` silently skips when tools are missing; no `terraform validate` | `scripts/validate.sh` | M4 |
-| P2-8 | Ansible uses `shell` for everything: not idempotent, restarts nginx every run | `ansible/playbook.yml` | Deferred unless time allows: no reachable host (inventory IP does not exist), lowest blast radius |
+| P2-8 | Ansible uses `shell` for everything: not idempotent, restarts nginx every run | `ansible/playbook.yml` | Refactored into an idempotent role last (lowest blast radius; inventory host does not exist) — see Ansible section |
 | P2-9 | Docs reference `gitlab/.gitlab-ci.yml`; file is at repo root | `docs/EXERCISE.md:74` | Noted only |
 
 ---
@@ -123,6 +123,58 @@ Sandbox node SA is broader than production design. Hub credentials in the sandbo
 
 ### Verification
 Recorded with the deployment evidence (added at deploy time).
+
+---
+
+## Module 2 — Terraform / GCP / GKE
+
+### Observation
+
+| Focus area | Baseline | Location |
+|---|---|---|
+| IAM / credentials | App SA with `roles/owner`; JSON key created, exported as output, stored in state | `iam.tf` |
+| Cluster exposure | Authorized networks `0.0.0.0/0`; no private nodes (public node IPs) | `gke.tf:19-24` |
+| Workload identity | Not enabled; pods can read node credentials from the metadata server | `gke.tf` |
+| Node / workload separation | Single default pool, default SA, `cloud-platform` scope | `gke.tf:8-17` |
+| Upgrade / maintenance | No release channel, no maintenance window | `gke.tf` |
+| Deletion safeguards | `deletion_protection = false` | `gke.tf:6` |
+| State | Local state; backend only an example | `backend.tf.example` |
+| Reproducibility | Provider `>= 5.0` (8.10.0 today, any future major tomorrow), no lock file; runs on the `default` VPC; deprecated `remove_default_node_pool` | `versions.tf`, `variables.tf` |
+
+### Decision
+
+| Area | Change | Reason |
+|---|---|---|
+| IAM | **Delete** the application SA, its `roles/owner` binding, the key and the key output | The app calls no Google API. Least privilege for a workload with no need is *no identity*, not a smaller role |
+| IAM | Dedicated node SA with `roles/container.defaultNodeServiceAccount` + `artifactregistry.reader` on the one repository, behind `manage_iam` | Nodes need logs / metrics / image pull only. `manage_iam = false` + `node_service_account` for identities that cannot write IAM; a precondition stops a silent fallback to the default SA |
+| Exposure | Private nodes; public IP endpoint restricted to `master_authorized_networks` (required variable, `0.0.0.0/0` rejected by validation); `gcp_public_cidrs_access_enabled = false`; IAM-authorised DNS endpoint | No public node IPs. API reachable only from listed CIDRs, or with a Google identity that holds `container.clusters.connect` — reviewers do not need an IP allow-list entry |
+| Workload identity | `workload_pool` on the cluster, `GKE_METADATA` on every pool | Pods get their own (currently none) identity and cannot reach node credentials — this also contains the sandbox's broader node SA |
+| Separation | No default pool. `system` pool (1/zone) for GKE components; dedicated `payment` pool (autoscaling 1-3/zone) tainted `dedicated=payment:NoSchedule` — the Deployment carries the matching toleration + `nodeSelector: pool=payment`; Shielded VM secure boot | System components and application pods cannot starve each other; separate upgrade / scaling characteristics. Tainting the workload pool (not the system pool) cannot leave a system component without a schedulable node |
+| Upgrades | `REGULAR` release channel; maintenance window Sat/Sun 00:00-06:00 Asia/Bangkok (`BYDAY=FR,SA` at 17:00 UTC — RRULE days are UTC); node surge upgrade `max_surge 1 / max_unavailable 0`; auto-repair / auto-upgrade | Supported, patched versions with predictable timing; 12 h/week satisfies GKE's ≥ 48 h per 32 days; node upgrades never remove capacity first (works with the PDB from Module 5) |
+| Deletion | `deletion_protection = true` **and** `lifecycle { prevent_destroy = true }` | `deletion_protection` is enforced only when the cluster itself is deleted — after `destroy` has already removed the node pools. `prevent_destroy` rejects the whole plan first |
+| State | `backend "gcs" {}` with per-environment config (`envs/<env>.gcs.tfbackend`) | GCS backend locks natively; bucket: versioning, uniform access, public-access prevention; encryption at rest by default (CMEK optional). One prefix (or bucket) per environment limits blast radius |
+| Reproducibility | Provider `~> 8.10` + committed `.terraform.lock.hcl` (linux_amd64 + darwin_arm64); own VPC / subnet / secondary ranges in code; per-environment `envs/<env>.tfvars`; `name_suffix` for shared projects | Same plan on every machine; nothing depends on hand-made or pre-existing network resources |
+| NetworkPolicy enforcement | `datapath_provider = "ADVANCED_DATAPATH"` (Dataplane V2) | Module 5 NetworkPolicies are enforced, not decorative |
+| Registry | Artifact Registry repository with `immutable_tags = true` | A pushed tag can never be re-pointed; deployments still pin digests |
+
+### Intentionally not done
+
+- **Cloud NAT** — private nodes reach Artifact Registry / Google APIs via Private Google Access; no workload needs internet egress yet. Add with the first workload that does.
+- **Binary Authorization** — enforcement needs attestors and signing in CI (Module 4); enabling it before signing exists would block every deploy.
+- **CMEK for etcd / state bucket** — default Google-managed encryption accepted for this scope.
+- **CI Workload Identity Federation pool** — belongs with Module 4; it also needs IAM writes.
+
+### Risk / trade-off
+
+The sandbox applies with `manage_iam = false`, so nodes run as the default compute SA (`roles/editor`). Mitigated by `GKE_METADATA` (pods cannot obtain the node token), private nodes and Shielded VMs; the dedicated node SA is ready in code for an identity with IAM rights. Regional cluster = 3 zones × 2 pools: higher cost than zonal, chosen for control-plane and zonal-failure availability of a payment service.
+
+### Verification
+
+- `terraform fmt -check`, `terraform validate` — clean, no deprecation warnings.
+- `terraform plan` against the real project (read-only, local backend copy, short-lived token): 6 resources to create with `envs/sandbox.tfvars`; 9 (adds node SA + two bindings) with `manage_iam = true` — before Module 4 added the CI identity (24 at HEAD, see Module 4).
+- Negative checks: `master_authorized_networks = {any = "0.0.0.0/0"}` → `Invalid value for variable`; `manage_iam = false` without `node_service_account` → `Resource precondition failed`.
+- Independent review pass found three issues, all fixed: `deletion_protection` alone lets `destroy` delete node pools first; maintenance `BYDAY` was shifted a day by UTC evaluation; the workload pool was untainted.
+- Apply results are recorded with the deployment evidence.
 
 ---
 
@@ -191,100 +243,6 @@ The startup cache code is not in this repository, so its real peak is unknown. A
 
 ---
 
-## Module 5 — Kustomize + Argo CD GitOps
-
-### Observation
-
-| Problem | Location |
-|---|---|
-| Production patch targets `wrong-payment-api-name` → overlay does not render | `gitops/overlays/production/patch-deployment.yaml:4` |
-| Production overlay namespace `default` | `gitops/overlays/production/kustomization.yaml:3` |
-| Argo CD production app deploys **base**, into `default`, from `HEAD` | `argocd/production.yaml:10-14` |
-| Mutable images everywhere (`latest`, `rc`) | overlays |
-| `APP_ENV=production` hard-coded in base (dev / staging claim to be production); ConfigMap never consumed | base |
-| HPA `minReplicas: 2` overrides production 5 replicas | `hpa.yaml:10` |
-| `default` AppProject: any repo, any destination, any kind | `argocd/*.yaml` |
-
-### Decision
-
-- **Production config lives only in the overlay** (requirement: base not edited for production): namespace `payment-production`, requests 500m / 512Mi (+ 512Mi limit) via `patch-deployment.yaml` (target fixed), HPA floor 5 via a JSON patch, image by **digest**.
-- **Replicas = 5 is implemented as HPA `minReplicas: 5`**, and `spec.replicas` is removed from the Deployment. Keeping both makes the HPA and Argo CD self-heal fight. Ambiguity noted: if "exactly 5" is intended, remove the HPA in the production overlay instead.
-- **Base is environment-neutral**: no namespace, no registry, no environment name. `APP_ENV` / `LOG_LEVEL` set per overlay through `configMapGenerator` (`behavior: merge`); the generated name hash rolls pods on config change.
-- **Every overlay pins a digest.** dev / staging digests are written by CI after a `main` build; production changes only through a reviewed merge request that copies a digest already verified in staging.
-- **Namespaces are in Git** (`pod-security.kubernetes.io/enforce: restricted`, annotated `Prune=false` so a Git mistake cannot delete a namespace together with its out-of-band Secret).
-- **Argo CD**: dedicated `payment` AppProject restricting source repo, destinations (three namespaces on cluster `payment-gke`) and the resource kinds the overlays render. Applications point at overlays, track `main`, auto-sync with prune + self-heal, plus:
-  - `ignoreDifferences` on Deployment `/spec/replicas` with `RespectIgnoreDifferences=true` — removing `spec.replicas` from Git would otherwise make the first client-side apply reset the running Deployment to **1** replica (field present in last-applied config, absent in desired) before the HPA reacts;
-  - `PruneLast=true` — the previous hash-suffixed ConfigMap is pruned only after the new pods are healthy, so a failed rollout can still restart old pods.
-
-  Both were found by the independent review pass. `scripts/validate.sh` renders `argocd/` too.
-- PDB `maxUnavailable: 1` (works at any replica count; `minAvailable: 2` at 2 replicas blocked every drain). NetworkPolicy becomes default-deny with explicit allows: ingress TCP 8080 from the same namespace, egress DNS to kube-dns and the three data-service ports.
-
-### Reason
-
-Folder-per-environment on one branch keeps one source of truth and makes promotion a one-line, reviewable diff (the digest). Rejected: branch-per-environment (drift, cherry-picks, merge conflicts); an image-updater writing directly to production (bypasses review).
-
-### Risk / trade-off
-
-Production auto-sync means a merged change deploys immediately. Accepted because the gate is the merge (protected branch, CODEOWNERS on `gitops/overlays/production/`), the digest was already verified in staging, and rollout is `maxUnavailable: 0` behind readiness. Placeholder digests (`sha256:000…`) were replaced by the first real build at deployment (`c2bd98b`). NetworkPolicy egress to data-service ports is not restricted by destination because their location is not defined in this repository.
-
-### Verification
-
-`scripts/validate.sh`: renders all overlays and `argocd/`, asserts production requirements, fails on `privileged`, `:latest`, Deployment `replicas`, or credential literals (negative tests run: HPA floor 4, privileged re-added, tag instead of digest — all rejected). Server-side dry-run and live sync are recorded with the deployment evidence.
-
----
-
-## Module 2 — Terraform / GCP / GKE
-
-### Observation
-
-| Focus area | Baseline | Location |
-|---|---|---|
-| IAM / credentials | App SA with `roles/owner`; JSON key created, exported as output, stored in state | `iam.tf` |
-| Cluster exposure | Authorized networks `0.0.0.0/0`; no private nodes (public node IPs) | `gke.tf:19-24` |
-| Workload identity | Not enabled; pods can read node credentials from the metadata server | `gke.tf` |
-| Node / workload separation | Single default pool, default SA, `cloud-platform` scope | `gke.tf:8-17` |
-| Upgrade / maintenance | No release channel, no maintenance window | `gke.tf` |
-| Deletion safeguards | `deletion_protection = false` | `gke.tf:6` |
-| State | Local state; backend only an example | `backend.tf.example` |
-| Reproducibility | Provider `>= 5.0` (8.10.0 today, any future major tomorrow), no lock file; runs on the `default` VPC; deprecated `remove_default_node_pool` | `versions.tf`, `variables.tf` |
-
-### Decision
-
-| Area | Change | Reason |
-|---|---|---|
-| IAM | **Delete** the application SA, its `roles/owner` binding, the key and the key output | The app calls no Google API. Least privilege for a workload with no need is *no identity*, not a smaller role |
-| IAM | Dedicated node SA with `roles/container.defaultNodeServiceAccount` + `artifactregistry.reader` on the one repository, behind `manage_iam` | Nodes need logs / metrics / image pull only. `manage_iam = false` + `node_service_account` for identities that cannot write IAM; a precondition stops a silent fallback to the default SA |
-| Exposure | Private nodes; public IP endpoint restricted to `master_authorized_networks` (required variable, `0.0.0.0/0` rejected by validation); `gcp_public_cidrs_access_enabled = false`; IAM-authorised DNS endpoint | No public node IPs. API reachable only from listed CIDRs, or with a Google identity that holds `container.clusters.connect` — reviewers do not need an IP allow-list entry |
-| Workload identity | `workload_pool` on the cluster, `GKE_METADATA` on every pool | Pods get their own (currently none) identity and cannot reach node credentials — this also contains the sandbox's broader node SA |
-| Separation | No default pool. `system` pool (1/zone) for GKE components; dedicated `payment` pool (autoscaling 1-3/zone) tainted `dedicated=payment:NoSchedule` — the Deployment carries the matching toleration + `nodeSelector: pool=payment`; Shielded VM secure boot | System components and application pods cannot starve each other; separate upgrade / scaling characteristics. Tainting the workload pool (not the system pool) cannot leave a system component without a schedulable node |
-| Upgrades | `REGULAR` release channel; maintenance window Sat/Sun 00:00-06:00 Asia/Bangkok (`BYDAY=FR,SA` at 17:00 UTC — RRULE days are UTC); node surge upgrade `max_surge 1 / max_unavailable 0`; auto-repair / auto-upgrade | Supported, patched versions with predictable timing; 12 h/week satisfies GKE's ≥ 48 h per 32 days; node upgrades never remove capacity first (works with the PDB from Module 5) |
-| Deletion | `deletion_protection = true` **and** `lifecycle { prevent_destroy = true }` | `deletion_protection` is enforced only when the cluster itself is deleted — after `destroy` has already removed the node pools. `prevent_destroy` rejects the whole plan first |
-| State | `backend "gcs" {}` with per-environment config (`envs/<env>.gcs.tfbackend`) | GCS backend locks natively; bucket: versioning, uniform access, public-access prevention; encryption at rest by default (CMEK optional). One prefix (or bucket) per environment limits blast radius |
-| Reproducibility | Provider `~> 8.10` + committed `.terraform.lock.hcl` (linux_amd64 + darwin_arm64); own VPC / subnet / secondary ranges in code; per-environment `envs/<env>.tfvars`; `name_suffix` for shared projects | Same plan on every machine; nothing depends on hand-made or pre-existing network resources |
-| NetworkPolicy enforcement | `datapath_provider = "ADVANCED_DATAPATH"` (Dataplane V2) | Module 5 NetworkPolicies are enforced, not decorative |
-| Registry | Artifact Registry repository with `immutable_tags = true` | A pushed tag can never be re-pointed; deployments still pin digests |
-
-### Intentionally not done
-
-- **Cloud NAT** — private nodes reach Artifact Registry / Google APIs via Private Google Access; no workload needs internet egress yet. Add with the first workload that does.
-- **Binary Authorization** — enforcement needs attestors and signing in CI (Module 4); enabling it before signing exists would block every deploy.
-- **CMEK for etcd / state bucket** — default Google-managed encryption accepted for this scope.
-- **CI Workload Identity Federation pool** — belongs with Module 4; it also needs IAM writes.
-
-### Risk / trade-off
-
-The sandbox applies with `manage_iam = false`, so nodes run as the default compute SA (`roles/editor`). Mitigated by `GKE_METADATA` (pods cannot obtain the node token), private nodes and Shielded VMs; the dedicated node SA is ready in code for an identity with IAM rights. Regional cluster = 3 zones × 2 pools: higher cost than zonal, chosen for control-plane and zonal-failure availability of a payment service.
-
-### Verification
-
-- `terraform fmt -check`, `terraform validate` — clean, no deprecation warnings.
-- `terraform plan` against the real project (read-only, local backend copy, short-lived token): 6 resources to create with `envs/sandbox.tfvars`; 9 (adds node SA + two bindings) with `manage_iam = true` — before Module 4 added the CI identity (24 at HEAD, see Module 4).
-- Negative checks: `master_authorized_networks = {any = "0.0.0.0/0"}` → `Invalid value for variable`; `manage_iam = false` without `node_service_account` → `Resource precondition failed`.
-- Independent review pass found three issues, all fixed: `deletion_protection` alone lets `destroy` delete node pools first; maintenance `BYDAY` was shifted a day by UTC evaluation; the workload pool was untainted.
-- Apply results are recorded with the deployment evidence.
-
----
-
 ## Module 4 — GitLab CI/CD + DevSecOps
 
 ### Observation
@@ -343,6 +301,48 @@ Every artifact is built once and identified by digest; scanners, signature, SBOM
 - `tests/smoke.sh` passes against the local binary and fails against a closed port.
 - `scripts/validate.sh` (both sections) passes; `terraform validate` passes with `ci.tf`; `terraform plan` with `manage_iam = true` creates the WIF pool / provider, CI and build SAs, build bucket and their bindings (24 resources), and still 6 with the sandbox settings.
 - An independent review pass of this module found nine pipeline / IAM defects that static checks did not catch (YAML mapping in `script`, check jobs absent from MR pipelines, single-target `trivy config`, missing `serviceusage` / bucket-metadata / build-log permissions, shell-less cosign image and its registry auth, unowned `gitops/base/` and `CODEOWNERS`, non-blocking SAST). All fixed.
+
+---
+
+## Module 5 — Kustomize + Argo CD GitOps
+
+### Observation
+
+| Problem | Location |
+|---|---|
+| Production patch targets `wrong-payment-api-name` → overlay does not render | `gitops/overlays/production/patch-deployment.yaml:4` |
+| Production overlay namespace `default` | `gitops/overlays/production/kustomization.yaml:3` |
+| Argo CD production app deploys **base**, into `default`, from `HEAD` | `argocd/production.yaml:10-14` |
+| Mutable images everywhere (`latest`, `rc`) | overlays |
+| `APP_ENV=production` hard-coded in base (dev / staging claim to be production); ConfigMap never consumed | base |
+| HPA `minReplicas: 2` overrides production 5 replicas | `hpa.yaml:10` |
+| `default` AppProject: any repo, any destination, any kind | `argocd/*.yaml` |
+
+### Decision
+
+- **Production config lives only in the overlay** (requirement: base not edited for production): namespace `payment-production`, requests 500m / 512Mi (+ 512Mi limit) via `patch-deployment.yaml` (target fixed), HPA floor 5 via a JSON patch, image by **digest**.
+- **Replicas = 5 is implemented as HPA `minReplicas: 5`**, and `spec.replicas` is removed from the Deployment. Keeping both makes the HPA and Argo CD self-heal fight. Ambiguity noted: if "exactly 5" is intended, remove the HPA in the production overlay instead.
+- **Base is environment-neutral**: no namespace, no registry, no environment name. `APP_ENV` / `LOG_LEVEL` set per overlay through `configMapGenerator` (`behavior: merge`); the generated name hash rolls pods on config change.
+- **Every overlay pins a digest.** dev / staging digests are written by CI after a `main` build; production changes only through a reviewed merge request that copies a digest already verified in staging.
+- **Namespaces are in Git** (`pod-security.kubernetes.io/enforce: restricted`, annotated `Prune=false` so a Git mistake cannot delete a namespace together with its out-of-band Secret).
+- **Argo CD**: dedicated `payment` AppProject restricting source repo, destinations (three namespaces on cluster `payment-gke`) and the resource kinds the overlays render. Applications point at overlays, track `main`, auto-sync with prune + self-heal, plus:
+  - `ignoreDifferences` on Deployment `/spec/replicas` with `RespectIgnoreDifferences=true` — removing `spec.replicas` from Git would otherwise make the first client-side apply reset the running Deployment to **1** replica (field present in last-applied config, absent in desired) before the HPA reacts;
+  - `PruneLast=true` — the previous hash-suffixed ConfigMap is pruned only after the new pods are healthy, so a failed rollout can still restart old pods.
+
+  Both were found by the independent review pass. `scripts/validate.sh` renders `argocd/` too.
+- PDB `maxUnavailable: 1` (works at any replica count; `minAvailable: 2` at 2 replicas blocked every drain). NetworkPolicy becomes default-deny with explicit allows: ingress TCP 8080 from the same namespace, egress DNS to kube-dns and the three data-service ports.
+
+### Reason
+
+Folder-per-environment on one branch keeps one source of truth and makes promotion a one-line, reviewable diff (the digest). Rejected: branch-per-environment (drift, cherry-picks, merge conflicts); an image-updater writing directly to production (bypasses review).
+
+### Risk / trade-off
+
+Production auto-sync means a merged change deploys immediately. Accepted because the gate is the merge (protected branch, CODEOWNERS on `gitops/overlays/production/`), the digest was already verified in staging, and rollout is `maxUnavailable: 0` behind readiness. Placeholder digests (`sha256:000…`) were replaced by the first real build at deployment (`c2bd98b`). NetworkPolicy egress to data-service ports is not restricted by destination because their location is not defined in this repository.
+
+### Verification
+
+`scripts/validate.sh`: renders all overlays and `argocd/`, asserts production requirements, fails on `privileged`, `:latest`, Deployment `replicas`, or credential literals (negative tests run: HPA floor 4, privileged re-added, tag instead of digest — all rejected). Server-side dry-run and live sync are recorded with the deployment evidence.
 
 ---
 
@@ -520,6 +520,37 @@ Blameless post-mortem within 3 working days: timeline, root cause and contributi
 
 ---
 
+## Ansible (P2-8) — `ansible/`
+
+### Observation
+
+Every task used `ansible.builtin.shell` (`apt-get update`, `apt-get install`, `mkdir`, `echo >`, `systemctl restart`): each run reports every task as changed, restarts nginx unconditionally, gives no useful `--check` output, and hard-codes systemd. The bootstrap role was empty ("Optional location for candidate refactor").
+
+### Decision
+
+Logic moved into `roles/bootstrap` with declarative modules: `apt` (cache valid 1 h), `file` and `copy` with explicit owner / mode (`environment={{ payment_environment }}` from role defaults), `service` (started + enabled). The nginx restart became a handler notified only when the config changes. The playbook only applies the role.
+
+### Reason
+
+Idempotence: a second run is a no-op, so runs are safe to repeat and any reported change is real drift; nginx restarts only when needed.
+
+### Risk / trade-off
+
+The inventory host (`10.10.0.10`) does not exist in the sandbox, so the role was verified in a throw-away Debian container instead of the target host. SSH user, `become` method and host-key policy still need to be defined per environment.
+
+### Verification
+
+```
+ansible-playbook -i inventory.yml playbook.yml --syntax-check          # ok
+# throw-away debian:bookworm-slim container, ansible-core 2.14, connection=local
+run 1: ok=6 changed=5    install, directory, config, start + handler "Restart nginx"
+run 2: ok=5 changed=0    no handler
+# baseline playbook in the same container: changed=4 on both runs, then fails on
+# `systemctl` (no systemd in a container) - the service module adapts to the init system
+```
+
+---
+
 ## Deployment and verification (sandbox `candidate-7sol-test`, 2026-11-08 UTC)
 
 ### What was deployed
@@ -639,6 +670,7 @@ Destroying the Artifact Registry repository deletes the image; the digests commi
 - **M3** — readiness on the named port, startup probe, right-sized requests with memory limit = request, `maxUnavailable: 0`, non-root / read-only / no capabilities.
 - **M4** — supply chain: tests, SAST, secret detection + blocking gate, govulncheck, IaC scan, Cloud Build (no dind), digest identity, image scan, SBOM, keyless signing / attestation, WIF auth (no keys), Git-based promotion with code-owned production; distroless non-root image; graceful shutdown; handler tests.
 - **M5** — production config only in the overlay; base environment-neutral; secrets out of Git; namespaces in Git with Pod Security `restricted`; HPA owns replicas (`minReplicas: 5`, `ignoreDifferences`); restricted AppProject; overlays tracked from `main`; PDB `maxUnavailable: 1`; default-deny NetworkPolicy.
+- **Ansible** — shell tasks replaced by an idempotent `bootstrap` role with a restart handler (second run: `changed=0`).
 - **M6 / M7** — written investigation, mitigation and incident command plans.
 
 ### Not changed, and why
@@ -650,7 +682,6 @@ Destroying the Artifact Registry repository deletes the image; the digests commi
 | External Secrets Operator + Secret Manager | Requires cluster RBAC the sandbox identity does not have; manifests already reference the Secret by name |
 | Argo CD inside a management GKE cluster | Same RBAC limit; hub runs outside GCP for the demonstration |
 | Dedicated node SA / CI WIF applied | Need IAM writes; code is ready behind `manage_iam` |
-| Ansible refactor | No reachable host; lowest blast radius |
 | Size the startup cache / final memory limit | Cache code is not in this repository; needs measurement |
 | Restrict egress destinations for data services | Their location is not defined in this repository |
 | Run the GitLab pipeline | Repository is delivered on GitHub |

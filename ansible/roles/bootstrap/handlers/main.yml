@@ -1,0 +1,6 @@
+---
+# Restart only when the config changed (was: on every run).
+- name: Restart nginx
+  ansible.builtin.service:
+    name: nginx
+    state: restarted

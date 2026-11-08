@@ -1,2 +1,33 @@
 ---
-# Optional location for candidate refactor.
+# Declarative modules instead of shell: each task reports "changed" only when
+# it changed something, so a second run is a no-op.
+
+- name: Install nginx
+  ansible.builtin.apt:
+    name: nginx
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Create application config directory
+  ansible.builtin.file:
+    path: /etc/payment
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Write application config
+  ansible.builtin.copy:
+    dest: /etc/payment/app.conf
+    content: "environment={{ payment_environment }}\n"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart nginx
+
+- name: Ensure nginx is running and enabled
+  ansible.builtin.service:
+    name: nginx
+    state: started
+    enabled: true
