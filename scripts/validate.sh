@@ -9,6 +9,10 @@ what="${1:-all}"
 
 if [[ $what == all || $what == terraform ]]; then
   need terraform
+  # Throw-away data dir: never touches an initialised backend or its credentials.
+  TF_DATA_DIR=$(mktemp -d)
+  export TF_DATA_DIR
+  trap 'rm -rf "$TF_DATA_DIR"' EXIT
   terraform -chdir=terraform fmt -check
   terraform -chdir=terraform init -backend=false -input=false >/dev/null
   terraform -chdir=terraform validate
