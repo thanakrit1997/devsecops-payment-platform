@@ -432,3 +432,86 @@ kafka-consumer-groups --describe --group <g>     # per partition: CURRENT-OFFSET
 - p2's leader on a degraded broker (disk, network, ISR shrink); unusually large messages on p2.
 
 Mitigation: poison message → route to a dead-letter topic after N attempts and record the skipped offset (payments: idempotent consumer + replay from the DLT after a fix); stuck / unhealthy consumer → restart or replace that instance; hot key → revisit the key (finer-grained key while preserving the ordering scope that is actually required). Long term: per-partition lag alerts (not only total lag), DLT pattern, idempotent consumers, key-distribution monitoring.
+
+---
+
+## Module 7 — Incident commander (`configs/INCIDENT.md`)
+
+Prepared in writing because this exercise is delivered as a take-home.
+
+```text
+15:10 payment-api v2.8.3 deployed      15:25 MongoDB latency rises sharply
+15:15 Kafka consumer lag rising         15:28 pod restarts increase
+15:20 Redis memory 92 %                 15:30 customer payment failures 37 %
+```
+
+### First 5 minutes (15:30-15:35)
+
+1. **Declare SEV-1**: 37 % of customer payments failing (baseline 0.1 %). Open the incident channel / bridge and a timeline document.
+2. **Assign roles** — the IC coordinates and decides, and does not debug:
+
+   | Role | Owns |
+   |---|---|
+   | Incident commander | Priorities, decisions, rollback call, severity |
+   | Operations lead | Executes the mitigation (rollback), owns the cluster / Argo CD |
+   | SMEs: data (MongoDB, Redis), streaming (Kafka), payment-api owner | Diagnosis in their area, report to ops lead |
+   | Communications lead | Status page, customer support, merchants / partners, executives |
+   | Scribe | Timeline: every observation, decision, action with timestamp |
+
+3. **Change freeze** for production: no merges to `main` except the incident change; pause non-critical batch / report jobs hitting MongoDB.
+4. **Impact assessment** (parallel, not blocking the decision): failure rate by endpoint / payment method / merchant; are failures clean declines or *ambiguous* (timeout after authorisation → possible double charge)? Money-at-risk and reconciliation scope start here.
+
+### Hypothesis and decision
+
+The only change is v2.8.3 at 15:10, and the cascade starts five minutes later in a plausible order: new behaviour fills Redis (e.g. keys without TTL / a new key pattern) → evictions and misses → load shifts to MongoDB → latency → consumers slow down → Kafka lag → timeouts, liveness failures / OOM → restarts → customer failures. Treat **v2.8.3 as the cause until disproved**.
+
+**Decision: roll back v2.8.3 now** — mitigate first, root-cause later.
+
+| Roll back when | Roll forward only when |
+|---|---|
+| Incident correlates with the deploy (it does) | Rollback is impossible or more dangerous |
+| Previous version is known good | The fix is small, understood, tested, and faster than rollback |
+| No irreversible change in v2.8.3: check for a non-backward-compatible DB migration or Kafka message-format change first (2 minutes) | A forward-only migration already ran |
+
+Time-box: if this check is not conclusive within ~10 minutes of declaring, roll back anyway.
+
+**How (GitOps)**: revert the production promotion commit (digest back to v2.8.2) and merge with the incident approver → Argo CD syncs. Break-glass if Git / CI is the bottleneck: disable auto-sync on `payment-api-production`, `argocd app rollback` to the previous revision, then make Git match and re-enable auto-sync — never leave Git and the cluster diverged.
+
+### Parallel mitigations (do not make things worse)
+
+- **Redis**: add memory / headroom if possible; **do not `FLUSHALL`** — an empty cache stampedes MongoDB.
+- **MongoDB**: shed non-critical reads (reports, analytics), pause batch jobs and backups on the primary.
+- **Kafka**: do not scale consumers beyond the partition count; after rollback the backlog drains — confirm consumers are idempotent so replays do not double-process payments.
+- **Restarts**: check OOM vs liveness. Restarts under load shrink capacity further; a temporary liveness relaxation is acceptable, a memory-limit increase only with evidence.
+
+### Evidence collection (snapshot before it disappears)
+
+`git diff v2.8.2..v2.8.3` (code + config), Argo CD history; `kubectl get events`, `describe` / `logs --previous` of restarted pods; Redis `INFO memory / stats / keyspace`, `--bigkeys` sample; MongoDB `currentOp`, profiler, `serverStatus`; `kafka-consumer-groups --describe` per partition; dashboards (error rate, latency, saturation) exported with timestamps; error breakdown by endpoint and status code; sample traces.
+
+### Communication
+
+- **Internal**: incident channel update every 15 minutes — impact, what we know, current action, next update time. Short executive summary on severity changes.
+- **External**: status page within ~15 minutes of declaring ("Some card payments are failing; we are mitigating; next update 16:00"), customer-support macro, notify payment partners / large merchants if their volume is affected. Facts only, no speculation, always a next-update time.
+
+### Verification of recovery (before standing down)
+
+- Error rate back to ~0.1 % and p99 latency at baseline, sustained for 30 minutes.
+- Pod restarts stop; Kafka lag drains to normal **on every partition**; Redis memory / evictions stable and hit rate recovering; MongoDB latency normal.
+- Synthetic end-to-end payment succeeds.
+- **Reconciliation**: list payments in 15:10-recovery with ambiguous outcomes; resolve each (complete, reverse, or notify) and check for duplicates.
+- Then downgrade severity, lift the freeze gradually, final status-page update.
+
+### Post-incident
+
+Blameless post-mortem within 3 working days: timeline, root cause and contributing factors (why did testing not catch it, why did detection take 20 minutes), what went well. Action items with owners and dates; reconciliation report.
+
+### SDLC controls that reduce recurrence
+
+| Control | Effect on this incident |
+|---|---|
+| Canary / progressive delivery with automated analysis (e.g. Argo Rollouts: error rate, latency, Redis memory) and auto-rollback | 5 % canary would have limited impact and rolled back in minutes |
+| Feature flags: deploy ≠ release | Turn the new behaviour off without a rollback |
+| Performance test in staging with production-like data and cache size | Cache growth / new query shape found before production |
+| Review checklists enforced in CI: TTL on every cache write, explain plan for new queries, backward-compatible (expand / contract) migrations, Kafka schema compatibility | Rollback always possible; known failure modes caught in review |
+| SLO burn-rate alerting; per-partition lag, Redis eviction, Mongo slow-query alerts | Detection in minutes, not at 37 % failures |
+| Payment-service change windows and rehearsed rollback runbook | Faster, calmer decision |
