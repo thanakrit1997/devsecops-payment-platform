@@ -1,0 +1,9 @@
+# Merges touching these paths need approval from the owning group
+# (protected main + "require code owner approval").
+# Production renders from the overlay AND the base, so both need release approval.
+/gitops/overlays/production/ @payment/release-approvers
+/gitops/base/                @payment/release-approvers
+/argocd/                     @payment/platform
+/terraform/                  @payment/platform
+/.gitlab-ci.yml              @payment/platform
+/CODEOWNERS                  @payment/platform

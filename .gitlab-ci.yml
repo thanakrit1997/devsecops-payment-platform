@@ -1,27 +1,226 @@
-stages:
-  - build
-  - deploy
+# Supply chain: test + scan source -> gate -> build once (Cloud Build,
+# immutable digest, SLSA provenance) -> scan image + SBOM -> sign -> promote by
+# Git commit. CI holds no cluster credentials: Argo CD applies whatever Git says.
+#
+# Required project settings (outside this file):
+#   - main is protected; code-owner approval required (CODEOWNERS)
+#   - environment "production" is protected (release approvers only)
+#   - GITOPS_PUSH_TOKEN: project access token, write_repository, masked + protected
+
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    # Promotion commits (and merged promotion MRs) only move digests: no rebuild.
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_COMMIT_MESSAGE !~ /^deploy:|^Merge branch 'promote\//
+
+stages: [test, gate, build, scan, sign, promote]
+
+include:
+  - template: Jobs/SAST.gitlab-ci.yml             # Semgrep (Go)
+  - template: Jobs/Secret-Detection.gitlab-ci.yml # gitleaks
 
 variables:
-  IMAGE: "$CI_REGISTRY_IMAGE:latest"
-  GOOGLE_APPLICATION_CREDENTIALS: "/tmp/gcp-key.json"
+  AST_ENABLE_MR_PIPELINES: "true" # run the security templates in MR pipelines too
+  GCP_PROJECT: candidate-7sol-test
+  GCP_REGION: asia-southeast1
+  IMAGE: asia-southeast1-docker.pkg.dev/candidate-7sol-test/payment-tn/payment-api
+  WIF_PROVIDER: projects/835903147987/locations/global/workloadIdentityPools/gitlab-tn/providers/gitlab
+  CI_SERVICE_ACCOUNT: gitlab-ci-tn@candidate-7sol-test.iam.gserviceaccount.com
+  BUILD_SERVICE_ACCOUNT: cloud-build-tn@candidate-7sol-test.iam.gserviceaccount.com
+  BUILD_BUCKET: candidate-7sol-test-build-source-tn
+  COSIGN_VERSION: v3.1.4
+  COSIGN_SHA256: 424e2c97d0b45fd7a6b608a87f090f35633f4c23ece5f092d48bba11aaf4bbfa # cosign-linux-amd64
+  # Tool images pinned by digest.
+  GO_IMAGE: golang:1.26@sha256:cfa27959837144bf4649802ba38e59daffd0dd2a7994aa83daaf113285b0f551
+  K8S_IMAGE: alpine/k8s:1.36.6@sha256:d9cb78be55e6e47c54e8a77bbf35ef87e98e5a03fbe5db7654d28bb78cc7d57e
+  TF_IMAGE: hashicorp/terraform:1.16.7@sha256:c9c77f5b9820832cbc7b88d16df406ac6e75fee5a9077e5437db0c54e5ff33e3
+  GCLOUD_IMAGE: google/cloud-sdk:592.0.0-slim@sha256:08c9cb2c82625689f26172f46f2cefdf30c3449959a71492569a824b537d369f
+  TRIVY_IMAGE: aquasec/trivy:0.76.2@sha256:8f6bb947dbc528902e11f2f5be52f7b519f6a39d5d148f41166f2040499768fb
+
+# Keyless GCP auth: the job's OIDC token is exchanged (Workload Identity
+# Federation) for a short-lived token of CI_SERVICE_ACCOUNT. The generated
+# file holds no secret, only where to find the token.
+.gcp-auth:
+  id_tokens:
+    GCP_ID_TOKEN:
+      aud: https://iam.googleapis.com/$WIF_PROVIDER
+  before_script:
+    - printf '%s' "$GCP_ID_TOKEN" > "$CI_PROJECT_DIR/.gcp_id_token"
+    - |
+      cat > "$CI_PROJECT_DIR/.gcp_creds.json" <<EOF
+      {
+        "type": "external_account",
+        "audience": "//iam.googleapis.com/$WIF_PROVIDER",
+        "subject_token_type": "urn:ietf:params:oauth:token-type:jwt",
+        "token_url": "https://sts.googleapis.com/v1/token",
+        "credential_source": {"file": "$CI_PROJECT_DIR/.gcp_id_token"},
+        "service_account_impersonation_url": "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/$CI_SERVICE_ACCOUNT:generateAccessToken"
+      }
+      EOF
+    - export GOOGLE_APPLICATION_CREDENTIALS="$CI_PROJECT_DIR/.gcp_creds.json"
+
+# Jobs without rules do not run in merge request pipelines.
+.checks:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+.main-only:
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH # protected: required by the WIF attribute condition
+
+# --- test ------------------------------------------------------------------
+
+unit-test:
+  stage: test
+  extends: .checks
+  image: $GO_IMAGE
+  script:
+    - cd application
+    - test -z "$(gofmt -l .)"
+    - go vet ./...
+    - go test -count=1 ./...
+
+dependency-scan:
+  stage: test
+  extends: .checks
+  image: $GO_IMAGE
+  script:
+    # Reports only vulnerabilities reachable from our code (module + stdlib).
+    - cd application && go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
+
+iac-scan:
+  stage: test
+  extends: .checks
+  image:
+    name: $TRIVY_IMAGE
+    entrypoint: [""]
+  script:
+    - trivy config --exit-code 1 --severity HIGH,CRITICAL .
+
+manifests:
+  stage: test
+  extends: .checks
+  image: $K8S_IMAGE
+  script:
+    - ./scripts/validate.sh manifests
+
+terraform:
+  stage: test
+  extends: .checks
+  image:
+    name: $TF_IMAGE
+    entrypoint: [""]
+  script:
+    - terraform -chdir=terraform fmt -check
+    - terraform -chdir=terraform init -backend=false -input=false
+    - terraform -chdir=terraform validate
+
+# The SAST / secret-detection templates only report. Block on High/Critical,
+# and fail closed if a report is missing (analyzer crashed or was skipped).
+security-gate:
+  stage: gate
+  extends: .checks
+  image: $K8S_IMAGE
+  needs: [semgrep-sast, secret_detection]
+  script:
+    - |
+      for r in gl-sast-report.json gl-secret-detection-report.json; do
+        jq -e '[.vulnerabilities[] | select(.severity == "High" or .severity == "Critical")] | length == 0' "$r"
+      done
+
+# --- build: once, on Google-managed builders (no privileged runner) -------
 
 build:
   stage: build
-  image: docker:latest
-  services:
-    - docker:dind
+  extends: [.gcp-auth, .main-only]
+  image: $GCLOUD_IMAGE
   script:
-    - echo "$GCP_SERVICE_ACCOUNT_KEY" > "$GOOGLE_APPLICATION_CREDENTIALS"
-    - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" "$CI_REGISTRY"
-    - docker build -t "$IMAGE" application/
-    - docker push "$IMAGE"
+    - gcloud auth login --cred-file="$GOOGLE_APPLICATION_CREDENTIALS" --quiet
+    # Tag = commit SHA (tags are immutable in the repository); everything
+    # downstream uses the digest.
+    - >
+      gcloud builds submit application
+      --project "$GCP_PROJECT" --region "$GCP_REGION"
+      --tag "$IMAGE:$CI_COMMIT_SHA"
+      --service-account "projects/$GCP_PROJECT/serviceAccounts/$BUILD_SERVICE_ACCOUNT"
+      --gcs-source-staging-dir "gs://$BUILD_BUCKET/source"
+      --gcs-log-dir "gs://$BUILD_BUCKET/logs"
+    - DIGEST=$(gcloud artifacts docker images describe "$IMAGE:$CI_COMMIT_SHA" --format='value(image_summary.digest)')
+    - echo "IMAGE_REF=$IMAGE@$DIGEST" > build.env
+  artifacts:
+    reports:
+      dotenv: build.env
 
-deploy-production:
-  stage: deploy
-  image: bitnami/kubectl:latest
-  only:
-    - main
+# --- scan + SBOM -------------------------------------------------------------
+
+image-scan:
+  stage: scan
+  extends: [.gcp-auth, .main-only]
+  image:
+    name: $TRIVY_IMAGE
+    entrypoint: [""]
+  needs: [build]
   script:
-    - echo "$GCP_SERVICE_ACCOUNT_KEY" > "$GOOGLE_APPLICATION_CREDENTIALS"
-    - kubectl apply -k gitops/overlays/production
+    - trivy image --exit-code 1 --severity HIGH,CRITICAL --ignore-unfixed "$IMAGE_REF"
+    - trivy image --format cyclonedx --output sbom.cdx.json "$IMAGE_REF"
+  artifacts:
+    paths: [sbom.cdx.json]
+
+# --- sign: keyless (Sigstore), identity = this pipeline ----------------------
+
+sign:
+  stage: sign
+  extends: [.gcp-auth, .main-only]
+  image: $GCLOUD_IMAGE
+  needs: [build, image-scan]
+  id_tokens:
+    SIGSTORE_ID_TOKEN:
+      aud: sigstore
+  script:
+    - curl -sSfLo /usr/local/bin/cosign "https://github.com/sigstore/cosign/releases/download/$COSIGN_VERSION/cosign-linux-amd64"
+    - echo "$COSIGN_SHA256  /usr/local/bin/cosign" | sha256sum -c -
+    - chmod +x /usr/local/bin/cosign
+    - gcloud auth login --cred-file="$GOOGLE_APPLICATION_CREDENTIALS" --quiet
+    - gcloud auth print-access-token | cosign login "${IMAGE%%/*}" -u oauth2accesstoken --password-stdin
+    - cosign sign --yes "$IMAGE_REF"
+    - cosign attest --yes --type cyclonedx --predicate sbom.cdx.json "$IMAGE_REF"
+
+# --- promote: Git is the only path to a cluster -----------------------------
+
+.gitops-commit:
+  image: $K8S_IMAGE
+  before_script:
+    - git config user.name "payment-ci"
+    - git config user.email "payment-ci@noreply.invalid"
+    - git remote set-url origin "https://oauth2:${GITOPS_PUSH_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git"
+
+deploy-dev-staging:
+  stage: promote
+  extends: [.gitops-commit, .main-only]
+  needs: [build, sign]
+  script:
+    - for env in dev staging; do (cd "gitops/overlays/$env" && kustomize edit set image "payment-api=$IMAGE_REF"); done
+    - 'git commit -am "deploy: $CI_COMMIT_SHORT_SHA to dev, staging"'
+    - git push origin "HEAD:$CI_DEFAULT_BRANCH"
+
+# Opens a merge request; code owners approve it, then Argo CD syncs.
+promote-production:
+  stage: promote
+  extends: [.gitops-commit]
+  needs: [build, deploy-dev-staging]
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: manual
+  environment:
+    name: production
+    action: prepare
+  script:
+    - git switch -c "promote/$CI_COMMIT_SHORT_SHA"
+    - (cd gitops/overlays/production && kustomize edit set image "payment-api=$IMAGE_REF")
+    - 'git commit -am "deploy: $CI_COMMIT_SHORT_SHA to production"'
+    - >
+      git push origin "promote/$CI_COMMIT_SHORT_SHA"
+      -o merge_request.create
+      -o merge_request.target="$CI_DEFAULT_BRANCH"
+      -o merge_request.title="Promote $CI_COMMIT_SHORT_SHA to production"

@@ -281,3 +281,154 @@ The sandbox applies with `manage_iam = false`, so nodes run as the default compu
 - Negative checks: `master_authorized_networks = {any = "0.0.0.0/0"}` → `Invalid value for variable`; `manage_iam = false` without `node_service_account` → `Resource precondition failed`.
 - Independent review pass found three issues, all fixed: `deletion_protection` alone lets `destroy` delete node pools first; maintenance `BYDAY` was shifted a day by UTC evaluation; the workload pool was untainted.
 - Apply results are recorded with the deployment evidence.
+
+---
+
+## Module 4 — GitLab CI/CD + DevSecOps
+
+### Observation
+
+| Problem | Location |
+|---|---|
+| Long-lived SA JSON key echoed to `/tmp` in two jobs (one unused) | `.gitlab-ci.yml:7,15,26` |
+| CI `kubectl apply`s production on every push to `main` — a second writer next to Argo CD (and it could not even authenticate: no cluster credentials step) | `.gitlab-ci.yml:20-27` |
+| Mutable `:latest` image pushed to the GitLab registry, while overlays pull Artifact Registry | `.gitlab-ci.yml:6,17-18` |
+| No tests, SAST, dependency / secret / image scanning, SBOM, signing | — |
+| `docker:latest` + privileged `docker:dind`; registry password on the command line; `bitnami/kubectl:latest` | `.gitlab-ci.yml:11-16,22` |
+| Runtime image: full Debian, root user, unpinned bases | `application/Dockerfile` |
+| No Go tests; no graceful shutdown | `application/src/main.go` |
+
+### Decision — pipeline (`.gitlab-ci.yml`)
+
+| Requirement | Implementation |
+|---|---|
+| Testing | `unit-test`: gofmt, `go vet`, `go test` (new `src/main_test.go`) |
+| SAST | GitLab `Jobs/SAST` template (Semgrep), enabled in MR pipelines (`AST_ENABLE_MR_PIPELINES`) |
+| Dependency scanning | `govulncheck` — module + stdlib CVEs reachable from the code |
+| Secret scanning | GitLab `Jobs/Secret-Detection` template (gitleaks) |
+| Security gate | `security-gate` (stage `gate`, before any build): fails on any High / Critical finding in the SAST or secret-detection report, and fails closed if a report is missing — the templates alone only report |
+| IaC / config scanning | `trivy config` on the repository (Dockerfile, manifests, Terraform; HIGH/CRITICAL fail) |
+| Manifest + Terraform checks | `scripts/validate.sh manifests` (production requirements) and `terraform fmt/validate` |
+| Image build | Cloud Build (`gcloud builds submit`) — no privileged runner / dind; runs as a dedicated build SA that can only push to the one repository and write logs |
+| Immutable identity | Tag = commit SHA (repository has immutable tags); every later step uses `IMAGE@sha256:…` passed via dotenv artifact |
+| Image scanning | `trivy image --exit-code 1 --severity HIGH,CRITICAL --ignore-unfixed` on the digest |
+| SBOM | CycloneDX from Trivy, attached as a signed attestation |
+| Signing / provenance | `cosign sign` + `cosign attest` keyless (Sigstore; identity = this GitLab pipeline). Cosign binary pinned by version + SHA-256, registry login with the job's short-lived token. Cloud Build records SLSA build provenance for the image |
+| GCP authentication | Workload Identity Federation: per-job OIDC `id_token` → STS → short-lived token for `gitlab-ci` SA. Provider accepts only this project's **protected** refs (`terraform/ci.tf`). No key anywhere |
+| Promotion | `deploy-dev-staging` commits the digest to the dev + staging overlays; `promote-production` (manual) opens a merge request changing only the production digest |
+| Protected production | `promote-production` runs in protected environment `production`; production overlay **and the base it renders from** owned by `@payment/release-approvers`, `CODEOWNERS` itself owned by platform (code-owner approval on protected `main`); Argo CD syncs after merge |
+| CI does not own cluster state | CI identity has no Kubernetes permission at all; the only path to a cluster is a Git commit |
+
+Image hardening (`application/Dockerfile`): multi-stage, static `CGO_ENABLED=0` build with `-trimpath`; runtime `distroless/static-debian13:nonroot` (no shell, no package manager, uid 65532); both bases pinned by digest; explicit `COPY` instead of `COPY . .`. Builder moved to Go 1.26 (Go 1.23 is out of support; `go.mod` minimum unchanged). CI tool images are pinned by digest.
+
+Application: graceful shutdown on SIGTERM (`Server.Shutdown`, 20 s < 30 s grace period); handlers extracted into `newMux()` for testing.
+
+### Reason
+
+Every artifact is built once and identified by digest; scanners, signature, SBOM and every environment refer to the same bytes. Promotion is a reviewable Git diff, so the audit trail of "what runs in production, approved by whom" is the Git history.
+
+### Risk / trade-off
+
+- **Not executed**: the repository is delivered on GitHub, so this pipeline has not run on GitLab. Verified: YAML parses and every `script` entry is a string (a `deploy: …` commit message had silently become a YAML mapping — GitLab would reject the file); each job's commands were run locally where tools are available (`go vet/test`, `validate.sh`, `terraform validate`); the build path is exercised with Cloud Build during deployment.
+- `security-gate` evaluates the analyzers' own report format; GitLab Ultimate security policies would be the managed alternative.
+- `GITOPS_PUSH_TOKEN` is a long-lived project access token (write_repository only, masked, protected, with expiry). A GitLab-native short-lived alternative would remove it.
+- Signatures are produced but not yet **enforced** at admission (Binary Authorization / policy controller) — see Module 2.
+- WIF, CI and build SAs need IAM writes: in `terraform/ci.tf` behind `manage_iam` (not applicable with the sandbox's editor-only identity).
+
+### Verification
+
+- `go vet ./...`, `go test ./...` pass; the test fails when `/ready` output is changed (mutation check).
+- SIGTERM → `shutting down` logged, process exits 0.
+- `tests/smoke.sh` passes against the local binary and fails against a closed port.
+- `scripts/validate.sh` (both sections) passes; `terraform validate` passes with `ci.tf`; `terraform plan` with `manage_iam = true` creates the WIF pool / provider, CI and build SAs, build bucket and their bindings (24 resources), and still 6 with the sandbox settings.
+- An independent review pass of this module found nine pipeline / IAM defects that static checks did not catch (YAML mapping in `script`, check jobs absent from MR pipelines, single-target `trivy config`, missing `serviceusage` / bucket-metadata / build-log permissions, shell-less cosign image and its registry auth, unowned `gitops/base/` and `CODEOWNERS`, non-blocking SAST). All fixed.
+
+---
+
+## Module 6 — Data services (`configs/DATA-SCENARIOS.md`)
+
+Approach for all three: correlate the start time with changes (deploys, config, traffic, batch jobs) before tuning anything; mitigate first, root-cause second.
+
+### MongoDB — latency 20 ms → 900 ms; app CPU 30 %, Mongo CPU 42 %, disk I/O 95 %, connections 78 %
+
+**1. First hypotheses** (CPU is low, disk is saturated → operations are *waiting*, not computing)
+1. A query / index regression (new query shape, dropped or unused index) doing collection scans → many documents read from disk.
+2. Working set no longer fits the WiredTiger cache → cache misses become disk reads for *every* query.
+3. Storage limit reached: provisioned IOPS / throughput of the volume (cloud disk throttling) or a noisy co-tenant.
+4. Write-side I/O: bulk writes, index build, TTL deletions, checkpoint / journal pressure, a backup or snapshot.
+Connections at 78 % are most likely a *consequence*: slow operations hold connections longer and pools grow.
+
+**2. Evidence**
+```
+db.currentOp({secs_running: {$gt: 1}})                      # what is running now, planSummary, waiting on what
+db.setProfilingLevel(1, {slowms: 100}); db.system.profile   # slow ops: planSummary COLLSCAN, docsExamined vs nreturned, keysExamined
+db.coll.find(<top query>).explain("executionStats")
+db.serverStatus().wiredTiger.cache   # bytes in cache vs max, pages read into cache/s, app-thread eviction
+db.serverStatus().opLatencies, .globalLock.currentQueue, .connections
+mongotop / mongostat                 # which collection, reads vs writes
+iostat -x (await, %util, r/s vs w/s) + volume IOPS/throughput vs provisioned limit
+rs.status()                          # replication lag (majority write waits)
+```
+plus the deploy / batch-job timeline.
+
+**3. Query/index vs storage**
+
+| Signal | Query / index problem | Storage problem |
+|---|---|---|
+| Profiler | `COLLSCAN` or `docsExamined / nreturned` ≫ 1, concentrated in a few query shapes / collections | Plans are `IXSCAN` with low examined ratio, yet slow |
+| Simple `_id` lookup | Fast | Also slow — everything is slow |
+| Disk pattern | Read I/O follows those queries; stops when they are killed | Await high for all I/O; volume at its IOPS / throughput cap; cache-miss rate high across the workload |
+| Timeline | Starts with a deploy / new feature | Starts with data growth, a backup, a volume change, a noisy neighbour |
+
+**4. Immediate mitigation**
+- Roll back / feature-flag off the change that introduced the query (fastest, safest).
+- Kill clearly runaway operations (`db.killOp`) — selectively.
+- Shed or pause non-critical load: reports, analytics, batch jobs, backups running on the primary.
+- Raise volume performance (larger / faster disk: on GCP, PD size and type drive IOPS; online change).
+- Add the missing index only with care: an index build adds I/O to a saturated disk — build at low traffic.
+- Keep connection pools bounded with timeouts so the app fails fast instead of piling up.
+
+**5. Longer term**
+Slow-query and `COLLSCAN` alerting; index review as part of code review (explain plans for new queries); load test with production-like data volume before release; capacity plan so the working set fits RAM and disk has headroom; isolate analytics on a dedicated (hidden) secondary; SLO on p99 latency.
+
+### Redis — used 15 GB / maxmemory 16 GB, 2.3 M evicted keys, hit rate falling
+
+**What is likely happening**: Redis lives at `maxmemory` and evicts continuously; it is evicting keys that are still needed, so reads miss, fall through to the database (consistent with the MongoDB pressure) and refill the cache — churn. Evictions > 0 means the policy is not `noeviction` (that would surface as write errors instead).
+
+| Area | Investigation | What it tells |
+|---|---|---|
+| TTL behaviour | `INFO keyspace` (keys vs `expires`, `avg_ttl`); sample with `SCAN` + `TTL`; `expired_keys` rate | Keys written **without TTL** accumulate forever (often a recent code change) |
+| Eviction policy | `CONFIG GET maxmemory-policy` | With `volatile-*` and many non-TTL keys, only TTL keys are evictable — the hot cache entries get evicted while stale permanent keys stay. Pure cache → `allkeys-lfu` / `allkeys-lru` |
+| Hot keys | `redis-cli --hotkeys` (LFU policy), client metrics, short `MONITOR` sample | Single keys / shards saturating CPU or network |
+| Big keys | `redis-cli --bigkeys` / `--memkeys`, `MEMORY USAGE`, `MEMORY STATS`, `mem_fragmentation_ratio` | A few huge hashes / lists / sets consume the memory; fragmentation wastes RSS |
+| Cache stampede | Miss bursts aligned with expiry / eviction of popular keys; DB QPS spikes | Many clients recompute the same key at once → DB overload. Fix: single-flight / lock per key, TTL jitter, stale-while-revalidate, early refresh |
+| Persistence / replication | `INFO persistence` (`rdb_bgsave_in_progress`, `latest_fork_usec`, AOF rewrite), `INFO replication`, `client-output-buffer-limit` | RDB / AOF-rewrite fork uses copy-on-write: at 15/16 GB a write-heavy fork can push RSS over the host and get OOM-killed; replica full resync needs an RDB plus replication buffer. `maxmemory` must leave headroom (≈ 25-30 %) when persistence or replicas are on. Evictions on the primary propagate as `DEL`s to replicas |
+
+Mitigation: add memory or shards; set TTL on everything cached (and fix the code path that stopped doing so); `allkeys-lfu` for a pure cache; split big keys; protect the database from stampedes; do not mix non-evictable data (sessions, queues, locks) with cache in an instance that evicts. Long term: per-namespace memory budget, alerts on evictions and hit rate, TTL required in code review.
+
+### Kafka — `payment-events` lag: p0 10, p1 15, **p2 892 331**, p3 13
+
+**1. First suspicion**: a problem specific to partition 2, not general under-capacity (the other three are near zero with the same consumers). Either its consumer is **stuck** (offset not moving — poison message in a retry loop, hung call, an open transaction blocking the last stable offset) or the partition is **hot** (a skewed key sends far more traffic there than one consumer can process).
+
+**2. Evidence**
+```
+kafka-consumer-groups --describe --group <g>     # per partition: CURRENT-OFFSET, LOG-END-OFFSET, LAG, CONSUMER-ID, HOST
+```
+- Repeat over time: is p2's committed offset moving at all (stuck vs slow)? Is its log-end offset growing faster than the others (produce skew)?
+- Is p2 assigned at all (`CONSUMER-ID` = `-`)? Rebalance churn (`max.poll.interval.ms` exceeded) in consumer logs?
+- Consumer logs / metrics for the instance owning p2: errors, retries, deserialisation failures, GC, restarts.
+- Read the message at the stuck offset (`kafka-console-consumer --partition 2 --offset <n> --max-messages 1`).
+- Broker side: leader of p2, ISR / under-replicated partitions, that broker's disk and request latency.
+- Key distribution of recent messages on p2 (one merchant / account dominating?).
+
+**3. Would 4 → 20 consumers help? No.** In a consumer group each partition is consumed by at most one member. With 4 partitions, at most 4 consumers do work; 16 would idle. The backlog sits in partition 2 and only its single assigned consumer can drain it. Adding partitions would not move the existing backlog, does not split a single hot key, and changes key → partition mapping (breaking per-key ordering, which matters for payment events). More consumers help only when *all* partitions lag and there are at least as many partitions as consumers.
+
+**4. What makes one partition different**
+- Hot / skewed partition key (or a custom partitioner bug).
+- Poison message: a record that always fails → the consumer retries forever and never commits.
+- The consumer instance owning p2 is unhealthy (slow node, CPU limits, GC pauses, OOM restarts → rebalances).
+- Downstream dependency slow only for keys on p2 (e.g. one merchant's database shard).
+- `read_committed` consumers blocked by a hanging producer transaction on p2 (last stable offset does not advance).
+- p2's leader on a degraded broker (disk, network, ISR shrink); unusually large messages on p2.
+
+Mitigation: poison message → route to a dead-letter topic after N attempts and record the skipped offset (payments: idempotent consumer + replay from the DLT after a fix); stuck / unhealthy consumer → restart or replace that instance; hot key → revisit the key (finer-grained key while preserving the ordering scope that is actually required). Long term: per-partition lag alerts (not only total lag), DLT pattern, idempotent consumers, key-distribution monitoring.
