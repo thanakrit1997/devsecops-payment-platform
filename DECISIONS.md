@@ -611,9 +611,12 @@ GitOps self-heal:
 #    from google_container_cluster.main and set deletion_protection = false; then:
 terraform -chdir=terraform apply  -var-file=envs/sandbox.tfvars -var 'master_authorized_networks={"operator"="<ip>/32"}'
 terraform -chdir=terraform destroy -var-file=envs/sandbox.tfvars -var 'master_authorized_networks={"operator"="<ip>/32"}'
-# 2. state bucket last
+# 2. bucket auto-created by the first (failed, Cloud Build API disabled) `gcloud builds submit`:
+#    holds one 1.9 KB source tarball of application/
+gcloud storage rm -r gs://candidate-7sol-test_cloudbuild
+# 3. state bucket last
 gcloud storage rm -r gs://candidate-7sol-test-tfstate-tn
-# 3. local hub
+# 4. local hub
 kind delete cluster --name argocd-hub
 ```
 Destroying the Artifact Registry repository deletes the image; the digests committed in the overlays then need a rebuild (new digest) before the next deployment.
