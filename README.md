@@ -26,12 +26,14 @@ make app-test            # go vet + unit tests
 make validate            # terraform fmt/validate, render all overlays + argocd/, assert production requirements
 make render-production   # rendered production manifests
 
-docker build -t payment-api application && docker run --rm -p 8080:8080 -e APP_ENV=local payment-api
-tests/smoke.sh http://localhost:8080
+docker build -t payment-api application
+docker run -d --rm --name payment-api -p 8080:8080 -e APP_ENV=local payment-api
+tests/smoke.sh http://localhost:8080 && docker stop payment-api
 ```
 
 `scripts/validate.sh` fails if production loses any requirement (namespace `payment-production`, HPA floor 5,
-500m / 512Mi requests, image pinned by digest) or regains `privileged`, `:latest`, `spec.replicas`, or a credential literal.
+500m / 512Mi requests, image pinned by digest) or regains `privileged`, `:latest`, `spec.replicas`, or one of the
+baseline's credential literals (a known-string check, not a general secret scanner — CI runs secret detection).
 
 ## Deploy (GCP)
 
@@ -43,17 +45,18 @@ gcloud storage buckets create gs://candidate-7sol-test-tfstate-tn --location=asi
   --uniform-bucket-level-access --public-access-prevention
 gcloud storage buckets update gs://candidate-7sol-test-tfstate-tn --versioning
 
-# 1. infrastructure
-cd terraform
-terraform init -backend-config=envs/sandbox.gcs.tfbackend
-terraform apply -var-file=envs/sandbox.tfvars -var 'master_authorized_networks={"operator"="<your-ip>/32"}'
+# 1. infrastructure (from the repository root)
+terraform -chdir=terraform init -backend-config=envs/sandbox.gcs.tfbackend
+terraform -chdir=terraform apply -var-file=envs/sandbox.tfvars -var 'master_authorized_networks={"operator"="<your-ip>/32"}'
 
-# 2. image (CI does this on Cloud Build; digest goes into the overlays)
+# 2. image (CI does this on Cloud Build), then pin its digest in the overlays and push to Git
 docker buildx build --platform linux/amd64 --push \
   -t asia-southeast1-docker.pkg.dev/candidate-7sol-test/payment-tn/payment-api:$(git rev-parse HEAD) application
 (cd gitops/overlays/dev && kustomize edit set image payment-api=<image>@<digest>)   # kustomize CLI; same for staging, production
+git commit -am "deploy: <sha> to dev, staging, production" && git push
 
-# 3. per namespace, out of Git
+# 3. per environment, before the first sync: namespace, then the Secret (out of Git)
+kubectl create namespace payment-<env>        # Argo CD later applies the labels from Git
 kubectl -n payment-<env> create secret generic payment-api-secrets \
   --from-literal=MONGODB_URL=... --from-literal=API_SHARED_SECRET=...
 

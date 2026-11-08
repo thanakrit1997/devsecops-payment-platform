@@ -16,7 +16,8 @@ gcloud container clusters list; gcloud artifacts repositories list
 gcloud compute networks list; gcloud iam service-accounts list
 gcloud logging read 'logName:"cloudaudit.googleapis.com%2Factivity"'   # who created / deleted what
 curl -X POST https://cloudresourcemanager.googleapis.com/v1/projects/candidate-7sol-test:testIamPermissions \
-  -d '{"permissions":["resourcemanager.projects.setIamPolicy","container.clusterRoleBindings.create", ...]}'
+  -H "Authorization: Bearer $(gcloud auth print-access-token)" -H "Content-Type: application/json" \
+  -d '{"permissions":["resourcemanager.projects.setIamPolicy","iam.serviceAccounts.setIamPolicy","container.clusterRoleBindings.create","container.clusters.create"]}'
 gcloud iam roles describe roles/editor                    # actual permissions in the role
 gcloud resource-manager org-policies describe <constraint> --project=candidate-7sol-test --effective
 ```
@@ -45,7 +46,7 @@ Plan column: module where it is fixed, or why it is deferred.
 |---|---|---|---|---|
 | P0-1 | Application service account holds `roles/owner` | `terraform/iam.tf:6-10` | Any workload compromise = full project takeover (IAM, data, billing) | M2: delete — the app calls no GCP API |
 | P0-2 | Long-lived SA JSON key: created by Terraform, exported as output, stored in state, written to disk in CI | `terraform/iam.tf:12-19`, `.gitlab-ci.yml:7,15,26` | Combined with P0-1 this is an **owner key** living in state and CI variables; `sensitive = true` only hides it from CLI output | M2/M4: remove keys; CI uses OIDC → Workload Identity Federation |
-| P0-3 | Plaintext credentials in Git and in logs (MongoDB root password, API shared secret) | `gitops/base/payment-api/deployment.yaml:28`, `configmap.yaml:7`, `tests/fixtures/pod-logs-previous.txt:2` | Anyone with repo or log read access has DB root. Treat as **compromised → rotate** | M5: remove from Git, reference a Secret supplied out-of-band; rotation is an owner action |
+| P0-3 | Plaintext credentials in Git and in logs (MongoDB root password, API shared secret) | `gitops/base/payment-api/deployment.yaml:28`, `configmap.yaml:7`, `tests/fixtures/pod-logs-previous.txt:2` | Anyone with repo or log read access has DB root. Treat as **compromised → rotate** | M5: remove from the manifests, reference a Secret supplied out-of-band; rotation is an owner action. The fixture log is exercise evidence and stays untouched — rotation is what neutralises that copy |
 | P0-4 | Container runs `privileged: true` (and as root) | `deployment.yaml:49-50`, `application/Dockerfile:6-9` | Container escape → node → node SA credentials | M3/M5: drop privileged, non-root, read-only rootfs, drop ALL caps, seccomp |
 | P0-5 | GKE control plane reachable from `0.0.0.0/0`, nodes have public IPs | `terraform/gke.tf:19-24` | Internet-exposed API server for a payment cluster | M2: private nodes + narrowed authorized networks |
 | P0-6 | Production delivery path is broken and unsafe: overlay fails to render (patch targets `wrong-payment-api-name`); Argo CD prod app deploys **base** into `default` with auto-sync + prune from `HEAD`; CI also `kubectl apply`s prod on every push to `main` | `gitops/overlays/production/patch-deployment.yaml:4`, `argocd/production.yaml:10-18`, `.gitlab-ci.yml:20-27` | Production runs the wrong spec (2 CPU / 4Gi, `latest`, 2 replicas, `default` ns) and two writers fight over cluster state | M5 (overlay + Argo), M4 (CI out of prod) |
@@ -99,7 +100,7 @@ Availability of a payment service and credential exposure are both P0, but crede
 Credentials stay valid until rotated by the owner; removing them from Git does not un-leak them.
 
 ### Verification
-Behavioural findings were reproduced, not inferred: `kubectl kustomize gitops/overlays/production` fails with `no matches for Id Deployment.v1.apps/wrong-payment-api-name`; `go test ./...` reports no test files; `terraform providers` resolves `>= 5.0` to 8.10.0. Triage was cross-checked by an independent review pass that was not shown these conclusions. Each later module records its own verification.
+Behavioural findings were reproduced, not inferred: `kubectl kustomize gitops/overlays/production` fails with `no matches for Id Deployment.v1.apps/wrong-payment-api-name`; `go test ./...` reports no test files; `terraform init` resolves `>= 5.0` to provider 8.10.0 (no lock file pins it). Triage was cross-checked by an independent review pass that was not shown these conclusions. Each later module records its own verification.
 
 ---
 
@@ -132,7 +133,7 @@ Recorded with the deployment evidence (added at deploy time).
 | Signal | Source | What it means |
 |---|---|---|
 | `Last State: Terminated`, `Reason: OOMKilled`, `Exit Code: 137`, `Restart Count: 8` | `pod-describe.txt:8-12` | Process killed for memory (137 = 128 + SIGKILL). CrashLoopBackOff is only the kubelet's back-off after repeated kills |
-| Last log line `allocating startup cache`, 5 s after start, then termination | `pod-logs-previous.txt:4-5` | Memory spike during startup |
+| `allocating startup cache` 4 s after `listening`, then `process terminated` 5 s later | `pod-logs-previous.txt:1,4-5` | Memory spike during startup |
 | `Readiness probe failed: dial tcp 10.20.1.13:8081: connect: connection refused` | `pod-describe.txt:17`, `events.txt:2` | Nothing listens on 8081; the app logs `listening on :8080` |
 | `FailedScheduling 0/2 nodes are available: 2 Insufficient cpu, 2 Insufficient memory` | `events.txt:4` | Requests of 2 CPU / 4Gi do not fit next to existing requests |
 | Nodes at 83-88 % CPU, 88-91 % memory | `nodes.txt` | Little headroom; supports both the scheduling failure and node-level memory pressure |
@@ -224,7 +225,7 @@ Folder-per-environment on one branch keeps one source of truth and makes promoti
 
 ### Risk / trade-off
 
-Production auto-sync means a merged change deploys immediately. Accepted because the gate is the merge (protected branch, CODEOWNERS on `gitops/overlays/production/`), the digest was already verified in staging, and rollout is `maxUnavailable: 0` behind readiness. Placeholder digests (`sha256:000…`) remain until the first build writes real ones. NetworkPolicy egress to data-service ports is not restricted by destination because their location is not defined in this repository.
+Production auto-sync means a merged change deploys immediately. Accepted because the gate is the merge (protected branch, CODEOWNERS on `gitops/overlays/production/`), the digest was already verified in staging, and rollout is `maxUnavailable: 0` behind readiness. Placeholder digests (`sha256:000…`) were replaced by the first real build at deployment (`c2bd98b`). NetworkPolicy egress to data-service ports is not restricted by destination because their location is not defined in this repository.
 
 ### Verification
 
@@ -277,7 +278,7 @@ The sandbox applies with `manage_iam = false`, so nodes run as the default compu
 ### Verification
 
 - `terraform fmt -check`, `terraform validate` — clean, no deprecation warnings.
-- `terraform plan` against the real project (read-only, local backend copy, short-lived token): 6 resources to create with `envs/sandbox.tfvars`; 9 (adds node SA + two bindings) with `manage_iam = true`.
+- `terraform plan` against the real project (read-only, local backend copy, short-lived token): 6 resources to create with `envs/sandbox.tfvars`; 9 (adds node SA + two bindings) with `manage_iam = true` — before Module 4 added the CI identity (24 at HEAD, see Module 4).
 - Negative checks: `master_authorized_networks = {any = "0.0.0.0/0"}` → `Invalid value for variable`; `manage_iam = false` without `node_service_account` → `Resource precondition failed`.
 - Independent review pass found three issues, all fixed: `deletion_protection` alone lets `destroy` delete node pools first; maintenance `BYDAY` was shifted a day by UTC evaluation; the workload pool was untainted.
 - Apply results are recorded with the deployment evidence.
@@ -315,7 +316,7 @@ The sandbox applies with `manage_iam = false`, so nodes run as the default compu
 | SBOM | CycloneDX from Trivy, attached as a signed attestation |
 | Signing / provenance | `cosign sign` + `cosign attest` keyless (Sigstore; identity = this GitLab pipeline). Cosign binary pinned by version + SHA-256, registry login with the job's short-lived token. Cloud Build records SLSA build provenance for the image |
 | GCP authentication | Workload Identity Federation: per-job OIDC `id_token` → STS → short-lived token for `gitlab-ci` SA. Provider accepts only this project's **protected** refs (`terraform/ci.tf`). No key anywhere |
-| Promotion | `deploy-dev-staging` commits the digest to the dev + staging overlays; `promote-production` (manual) opens a merge request changing only the production digest |
+| Promotion | `deploy-dev-staging` commits the digest to the dev + staging overlays; `promote-production` (manual) opens a merge request changing only the production digest. On the target platform the GitLab project is the single source repository and Argo CD's `repoURL` points at it; this delivery copy lives on GitHub, so `argocd/` points there (no mirror implied) |
 | Protected production | `promote-production` runs in protected environment `production`; production overlay **and the base it renders from** owned by `@payment/release-approvers`, `CODEOWNERS` itself owned by platform (code-owner approval on protected `main`); Argo CD syncs after merge |
 | CI does not own cluster state | CI identity has no Kubernetes permission at all; the only path to a cluster is a Git commit |
 
@@ -329,7 +330,7 @@ Every artifact is built once and identified by digest; scanners, signature, SBOM
 
 ### Risk / trade-off
 
-- **Not executed**: the repository is delivered on GitHub, so this pipeline has not run on GitLab. Verified: YAML parses and every `script` entry is a string (a `deploy: …` commit message had silently become a YAML mapping — GitLab would reject the file); each job's commands were run locally where tools are available (`go vet/test`, `validate.sh`, `terraform validate`); the build path is exercised with Cloud Build during deployment.
+- **Not executed**: the repository is delivered on GitHub, so this pipeline has not run on GitLab. Verified: YAML parses and every `script` entry is a string (a `deploy: …` commit message had silently become a YAML mapping — GitLab would reject the file); each job's commands were run locally where tools are available (`go vet/test`, `validate.sh`, `terraform validate`); the image build was exercised during deployment with local `docker buildx` (Cloud Build API is disabled in the sandbox), so the Cloud Build step itself remains unverified.
 - `security-gate` evaluates the analyzers' own report format; GitLab Ultimate security policies would be the managed alternative.
 - `GITOPS_PUSH_TOKEN` is a long-lived project access token (write_repository only, masked, protected, with expiry). A GitLab-native short-lived alternative would remove it.
 - Signatures are produced but not yet **enforced** at admission (Binary Authorization / policy controller) — see Module 2.
@@ -361,10 +362,11 @@ Connections at 78 % are most likely a *consequence*: slow operations hold connec
 **2. Evidence**
 ```
 db.currentOp({secs_running: {$gt: 1}})                      # what is running now, planSummary, waiting on what
-db.setProfilingLevel(1, {slowms: 100}); db.system.profile   # slow ops: planSummary COLLSCAN, docsExamined vs nreturned, keysExamined
+db.setProfilingLevel(1, {slowms: 100})
+db.system.profile.find({millis: {$gt: 100}}).sort({ts: -1}).limit(20)   # planSummary COLLSCAN, docsExamined vs nreturned, keysExamined
 db.coll.find(<top query>).explain("executionStats")
 db.serverStatus().wiredTiger.cache   # bytes in cache vs max, pages read into cache/s, app-thread eviction
-db.serverStatus().opLatencies, .globalLock.currentQueue, .connections
+const s = db.serverStatus(); s.opLatencies; s.globalLock.currentQueue; s.connections
 mongotop / mongostat                 # which collection, reads vs writes
 iostat -x (await, %util, r/s vs w/s) + volume IOPS/throughput vs provisioned limit
 rs.status()                          # replication lag (majority write waits)
@@ -393,7 +395,7 @@ Slow-query and `COLLSCAN` alerting; index review as part of code review (explain
 
 ### Redis — used 15 GB / maxmemory 16 GB, 2.3 M evicted keys, hit rate falling
 
-**What is likely happening**: Redis lives at `maxmemory` and evicts continuously; it is evicting keys that are still needed, so reads miss, fall through to the database (consistent with the MongoDB pressure) and refill the cache — churn. Evictions > 0 means the policy is not `noeviction` (that would surface as write errors instead).
+**What is likely happening** (to confirm: `evicted_keys` is cumulative, so sample `INFO stats` twice for the eviction *rate*, and read `CONFIG GET maxmemory-policy`): Redis lives at `maxmemory` and evicts continuously; it is evicting keys that are still needed, so reads miss, fall through to the database (consistent with the MongoDB pressure) and refill the cache — churn. Evictions > 0 means the policy is not `noeviction` (that would surface as write errors instead).
 
 | Area | Investigation | What it tells |
 |---|---|---|
@@ -412,12 +414,12 @@ Mitigation: add memory or shards; set TTL on everything cached (and fix the code
 
 **2. Evidence**
 ```
-kafka-consumer-groups --describe --group <g>     # per partition: CURRENT-OFFSET, LOG-END-OFFSET, LAG, CONSUMER-ID, HOST
+kafka-consumer-groups --bootstrap-server <broker:9092> --describe --group <g>   # per partition: CURRENT-OFFSET, LOG-END-OFFSET, LAG, CONSUMER-ID, HOST
 ```
 - Repeat over time: is p2's committed offset moving at all (stuck vs slow)? Is its log-end offset growing faster than the others (produce skew)?
 - Is p2 assigned at all (`CONSUMER-ID` = `-`)? Rebalance churn (`max.poll.interval.ms` exceeded) in consumer logs?
 - Consumer logs / metrics for the instance owning p2: errors, retries, deserialisation failures, GC, restarts.
-- Read the message at the stuck offset (`kafka-console-consumer --partition 2 --offset <n> --max-messages 1`).
+- Read the message at the stuck offset (`kafka-console-consumer --bootstrap-server <broker:9092> --topic payment-events --partition 2 --offset <n> --max-messages 1`).
 - Broker side: leader of p2, ISR / under-replicated partitions, that broker's disk and request latency.
 - Key distribution of recent messages on p2 (one merchant / account dominating?).
 
@@ -539,9 +541,9 @@ GKE payment-production-tn (regional asia-southeast1, 1.36.4-gke.2377000, REGULAR
 | Step | Command | Result |
 |---|---|---|
 | State bucket | `gcloud storage buckets create gs://candidate-7sol-test-tfstate-tn --uniform-bucket-level-access --public-access-prevention` + `--versioning` | versioned, public access prevention enforced |
-| Infrastructure | `terraform init -backend-config=envs/sandbox.gcs.tfbackend`; `plan -out`; `apply sandbox.tfplan` | `Apply complete! Resources: 6 added` (19:27:43 → 19:33:52) |
+| Infrastructure | `terraform init -backend-config=envs/sandbox.gcs.tfbackend`; `terraform plan -var-file=envs/sandbox.tfvars -var 'master_authorized_networks={…}' -out=sandbox.tfplan`; `terraform apply sandbox.tfplan` | `Apply complete! Resources: 6 added` (19:27:43 → 19:33:52) |
 | Cluster posture | `gcloud container clusters describe` | private nodes; authorized networks = one operator /32, GCP public CIDRs off; DNS endpoint external traffic on; Workload Identity pool; `ADVANCED_DATAPATH`; window `FREQ=WEEKLY;BYDAY=FR,SA` 17:00-23:00 UTC |
-| Image | `docker buildx build --platform linux/amd64 --push application` | `…/payment-api:cb5f0ed…@sha256:71c68aed57c996931734763ed84aaa9f7c722e9fbe5db088d91840e6c2ed4b62`; digest committed to all overlays (`c2bd98b`) |
+| Image | `docker buildx build --platform linux/amd64 --push -t …/payment-tn/payment-api:<commit-sha> application` | `…/payment-api:cb5f0ed…@sha256:71c68aed57c996931734763ed84aaa9f7c722e9fbe5db088d91840e6c2ed4b62`; digest committed to all overlays (`c2bd98b`) |
 | Namespaces + secrets | namespaces from rendered overlays; `kubectl create secret generic payment-api-secrets` with random values (out of Git) | PSA `restricted` enforce / warn / audit |
 | Server-side dry-run | `kubectl apply --dry-run=server -k gitops/overlays/<env>` | all objects accepted, **no Pod Security warnings** |
 | GitOps | AppProject + Applications applied to the hub; GKE registered as `payment-gke` | all three `Synced / Healthy` at revision `ebcd128` |

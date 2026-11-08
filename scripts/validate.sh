@@ -31,8 +31,9 @@ if [[ $what == all || $what == manifests ]]; then
   fail() { echo "FAIL production: $1" >&2; exit 1; }
   grep -q  'namespace: payment-production'       <<<"$prod" || fail "namespace must be payment-production"
   grep -q  'minReplicas: 5'                      <<<"$prod" || fail "HPA floor must be 5 replicas"
-  grep -q  'cpu: 500m'                           <<<"$prod" || fail "cpu request must be 500m"
-  grep -q  'memory: 512Mi'                       <<<"$prod" || fail "memory request must be 512Mi"
+  requests=$(grep -A2 'requests:' <<<"$prod")    # rendered keys are sorted: requests -> cpu, memory
+  grep -q  'cpu: 500m'                           <<<"$requests" || fail "cpu request must be 500m"
+  grep -q  'memory: 512Mi'                       <<<"$requests" || fail "memory request must be 512Mi"
   grep -Eq 'image: [^ ]+@sha256:[0-9a-f]{64}$'   <<<"$prod" || fail "image must be pinned by digest"
   grep -Eq 'privileged: true|:latest|replicas: ' <<<"$prod" && fail "privileged container, :latest tag, or Deployment replicas (HPA owns it)"
   grep -Eq 'supersecret|plaintext-secret'        <<<"$prod" && fail "credential literal rendered"
