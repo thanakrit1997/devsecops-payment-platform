@@ -515,3 +515,149 @@ Blameless post-mortem within 3 working days: timeline, root cause and contributi
 | Review checklists enforced in CI: TTL on every cache write, explain plan for new queries, backward-compatible (expand / contract) migrations, Kafka schema compatibility | Rollback always possible; known failure modes caught in review |
 | SLO burn-rate alerting; per-partition lag, Redis eviction, Mongo slow-query alerts | Detection in minutes, not at 37 % failures |
 | Payment-service change windows and rehearsed rollback runbook | Faster, calmer decision |
+
+---
+
+## Deployment and verification (sandbox `candidate-7sol-test`, 2026-11-08 UTC)
+
+### What was deployed
+
+```
+Argo CD v3.5.7 (hub: kind cluster outside GCP)
+   │  pulls https://github.com/thanakrit1997/devsecops-payment-platform.git (main)
+   ▼
+GKE payment-production-tn (regional asia-southeast1, 1.36.4-gke.2377000, REGULAR)
+   ├─ pool system  : 3 nodes (1 / zone)
+   └─ pool payment : 3 nodes (1 / zone, autoscaling 1-3 / zone, tainted dedicated=payment)
+      ├─ payment-dev         payment-api x2
+      ├─ payment-staging     payment-api x2
+      └─ payment-production  payment-api x5   image …/payment-tn/payment-api@sha256:71c68aed…4b62
+```
+
+### Steps and results
+
+| Step | Command | Result |
+|---|---|---|
+| State bucket | `gcloud storage buckets create gs://candidate-7sol-test-tfstate-tn --uniform-bucket-level-access --public-access-prevention` + `--versioning` | versioned, public access prevention enforced |
+| Infrastructure | `terraform init -backend-config=envs/sandbox.gcs.tfbackend`; `plan -out`; `apply sandbox.tfplan` | `Apply complete! Resources: 6 added` (19:27:43 → 19:33:52) |
+| Cluster posture | `gcloud container clusters describe` | private nodes; authorized networks = one operator /32, GCP public CIDRs off; DNS endpoint external traffic on; Workload Identity pool; `ADVANCED_DATAPATH`; window `FREQ=WEEKLY;BYDAY=FR,SA` 17:00-23:00 UTC |
+| Image | `docker buildx build --platform linux/amd64 --push application` | `…/payment-api:cb5f0ed…@sha256:71c68aed57c996931734763ed84aaa9f7c722e9fbe5db088d91840e6c2ed4b62`; digest committed to all overlays (`c2bd98b`) |
+| Namespaces + secrets | namespaces from rendered overlays; `kubectl create secret generic payment-api-secrets` with random values (out of Git) | PSA `restricted` enforce / warn / audit |
+| Server-side dry-run | `kubectl apply --dry-run=server -k gitops/overlays/<env>` | all objects accepted, **no Pod Security warnings** |
+| GitOps | AppProject + Applications applied to the hub; GKE registered as `payment-gke` | all three `Synced / Healthy` at revision `ebcd128` |
+
+### Evidence
+
+Production requirements, live:
+```
+deployment.apps/payment-api   5/5     5     5
+horizontalpodautoscaler       cpu: 0%/70%   MINPODS 5   MAXPODS 10   REPLICAS 5
+poddisruptionbudget           MAX UNAVAILABLE 1   ALLOWED DISRUPTIONS 1
+endpointslice                 10.44.4.4,10.44.4.5,10.44.3.6 + 2 more
+resources       {"limits":{"memory":"512Mi"},"requests":{"cpu":"500m","memory":"512Mi"}}
+image           …/payment-tn/payment-api@sha256:71c68aed57c996931734763ed84aaa9f7c722e9fbe5db088d91840e6c2ed4b62
+securityContext {"allowPrivilegeEscalation":false,"capabilities":{"drop":["ALL"]},"readOnlyRootFilesystem":true}
+pod             {"runAsGroup":65532,"runAsNonRoot":true,"runAsUser":65532,"seccompProfile":{"type":"RuntimeDefault"}}
+pods            5 × ready=true restarts=0, zones a/a/b/b/c, all on pool "payment"
+```
+
+Smoke tests (`tests/smoke.sh` through `kubectl port-forward svc/payment-api`):
+```
+payment-dev         smoke test passed   {"status":"ready","env":"dev"}
+payment-staging     smoke test passed   {"status":"ready","env":"staging"}
+payment-production  smoke test passed   {"status":"ready","env":"production"}
+```
+
+Module 3 regression check — the **baseline** spec against the new namespace:
+```
+$ kubectl -n payment-dev apply --dry-run=server -f <baseline deployment.yaml from 30a6ac2>
+Warning: would violate PodSecurity "restricted:latest": privileged (container "payment-api" must not set
+securityContext.privileged=true), allowPrivilegeEscalation != false, unrestricted capabilities,
+runAsNonRoot != true, seccompProfile
+$ kubectl -n payment-dev apply --dry-run=server -f <Pod with the baseline pod spec>
+Error from server (Forbidden): pods "baseline-payment-api" is forbidden: violates PodSecurity "restricted:latest": privileged …
+```
+
+NetworkPolicy enforced (Dataplane V2):
+```
+(pod in payment-dev)      curl http://payment-api/ready              -> {"status":"ready","env":"dev"}
+(pod in payment-staging)  curl http://payment-api.payment-dev/ready  -> curl: (28) Connection timed out after 5000 milliseconds
+```
+
+GitOps self-heal:
+```
+19:42:45Z  kubectl -n payment-dev delete networkpolicy payment-api     # manual drift
+19:42:46Z  restored by Argo CD (creationTimestamp), app Synced/Healthy "successfully synced (all tasks run)"
+```
+
+### Found during deployment (and fixed in Git)
+
+| Finding | Fix |
+|---|---|
+| `min_node_count` is only a scale-down floor: the payment pool was created with **0 nodes** | `initial_node_count = 1` (`a074093`); pool replaced while empty — `Resources: 1 added, 1 destroyed` |
+| PSA `enforce` rejects Pods only — a privileged Deployment was accepted silently and would fail later at pod creation | `warn` + `audit` labels (`e010299`); the warning above is the result |
+| `validate.sh` in a directory initialised with the GCS backend tried to load state with ambient credentials | throw-away `TF_DATA_DIR` (`ebcd128`) |
+
+### Sandbox-only deviations (by design, not in the delivered code path)
+
+- **Image built locally** (`docker buildx`, `linux/amd64`) and pushed with a short-lived user token: the Cloud Build API is disabled in the sandbox, and enabling a new API in the owner's project was not necessary for the exercise. The CI path (`.gitlab-ci.yml`) still builds on Cloud Build.
+- **Argo CD hub on a local kind cluster** registered with a short-lived (1 h) user token, scoped to the three namespaces. The candidate identity cannot create RBAC in GKE (E3), so Argo CD cannot run in-cluster. Production: Argo CD in a management cluster using a GSA with `roles/container.developer` through Workload Identity. Workloads keep running when the hub is offline; only reconciliation pauses.
+- **Nodes use the default compute SA** (`manage_iam = false`, E2) — mitigated by `GKE_METADATA`.
+
+### Teardown
+
+```bash
+# 1. allow deletion (two deliberate edits, not committed): remove `lifecycle { prevent_destroy = true }`
+#    from google_container_cluster.main and set deletion_protection = false; then:
+terraform -chdir=terraform apply  -var-file=envs/sandbox.tfvars -var 'master_authorized_networks={"operator"="<ip>/32"}'
+terraform -chdir=terraform destroy -var-file=envs/sandbox.tfvars -var 'master_authorized_networks={"operator"="<ip>/32"}'
+# 2. state bucket last
+gcloud storage rm -r gs://candidate-7sol-test-tfstate-tn
+# 3. local hub
+kind delete cluster --name argocd-hub
+```
+Destroying the Artifact Registry repository deletes the image; the digests committed in the overlays then need a rebuild (new digest) before the next deployment.
+
+---
+
+## Final summary
+
+### Top three risks found
+
+1. **Credential and privilege exposure** — the application SA was project `owner` with a JSON key exported into Terraform state and CI; the MongoDB root password and an API secret were committed and logged; the container ran `privileged`. (P0-1 … P0-4)
+2. **Production delivery path broken and unsafe** — the production overlay did not render; Argo CD deployed the *base* into `default` from `HEAD` with prune; CI also `kubectl apply`'d production — two writers, no review gate. (P0-6)
+3. **Active outage with no recovery path** — readiness on the wrong port (no endpoints), OOM kills, unschedulable 2 CPU / 4Gi requests, and mutable `latest` images that made "what is running" and rollback unknowable. (P0-7, P1-1)
+
+### Changes made
+
+- **M2** — app SA, owner binding and key removed; private nodes, allow-listed API + IAM-gated DNS endpoint; Workload Identity; system / dedicated payment pools; release channel, maintenance window, surge upgrades; deletion protection + `prevent_destroy`; GCS state per environment; pinned provider + lock file; Dataplane V2; Artifact Registry with immutable tags.
+- **M3** — readiness on the named port, startup probe, right-sized requests with memory limit = request, `maxUnavailable: 0`, non-root / read-only / no capabilities.
+- **M4** — supply chain: tests, SAST, secret detection + blocking gate, govulncheck, IaC scan, Cloud Build (no dind), digest identity, image scan, SBOM, keyless signing / attestation, WIF auth (no keys), Git-based promotion with code-owned production; distroless non-root image; graceful shutdown; handler tests.
+- **M5** — production config only in the overlay; base environment-neutral; secrets out of Git; namespaces in Git with Pod Security `restricted`; HPA owns replicas (`minReplicas: 5`, `ignoreDifferences`); restricted AppProject; overlays tracked from `main`; PDB `maxUnavailable: 1`; default-deny NetworkPolicy.
+- **M6 / M7** — written investigation, mitigation and incident command plans.
+
+### Not changed, and why
+
+| Not done | Why |
+|---|---|
+| Rotate the leaked MongoDB / API credentials, purge from history | Owner action; rotation is required regardless of Git cleanup |
+| Enforce signatures at admission (Binary Authorization / policy controller) | Needs signing to run first in CI; would block every deploy today |
+| External Secrets Operator + Secret Manager | Requires cluster RBAC the sandbox identity does not have; manifests already reference the Secret by name |
+| Argo CD inside a management GKE cluster | Same RBAC limit; hub runs outside GCP for the demonstration |
+| Dedicated node SA / CI WIF applied | Need IAM writes; code is ready behind `manage_iam` |
+| Ansible refactor | No reachable host; lowest blast radius |
+| Size the startup cache / final memory limit | Cache code is not in this repository; needs measurement |
+| Restrict egress destinations for data services | Their location is not defined in this repository |
+| Run the GitLab pipeline | Repository is delivered on GitHub |
+
+### How the work was verified
+
+`scripts/validate.sh` with negative tests; `go test` with a mutation check; `terraform validate`, `plan` against the real project, `apply`; server-side dry-run; live checks of every production requirement; Pod Security rejection of the baseline spec; NetworkPolicy allow / deny; Argo CD self-heal; smoke tests in all three environments. Independent review passes found 14 defects across Modules 2-5 (all fixed); deployment surfaced 3 more (all fixed).
+
+### Next, before real production
+
+1. Rotate the exposed credentials; move secrets to Secret Manager via External Secrets.
+2. Enforce signed images at admission; run the GitLab pipeline end-to-end (WIF, Cloud Build SA, protected environment).
+3. Argo CD in a management cluster with Workload Identity; private control-plane endpoint through VPN / IAP.
+4. Progressive delivery (Argo Rollouts canary with SLO analysis) and SLO burn-rate alerting, per-partition lag, Redis eviction and Mongo slow-query alerts.
+5. Load-test startup and steady-state memory to set requests / limits; backup and restore drills for the data services.
