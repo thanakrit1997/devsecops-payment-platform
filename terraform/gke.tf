@@ -113,6 +113,10 @@ resource "google_container_node_pool" "payment" {
   name    = "payment"
   cluster = google_container_cluster.main.id
 
+  # min_node_count is only a scale-down floor: without this the pool is
+  # created empty and waits for pending pods before adding any node.
+  initial_node_count = 1 # per zone
+
   autoscaling {
     min_node_count = 1 # per zone
     max_node_count = 3
